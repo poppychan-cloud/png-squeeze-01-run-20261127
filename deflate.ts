@@ -608,6 +608,326 @@ export function deflateOptimalBlocks(data, blockSize, maxChain = 64, niceLen = 3
   return out;
 }
 
+// ---- v3: Match Cache + Global DP (Carbon P1+P2) ----
+// Fixed-point DP costs in units of 1/64 bit (Uint32; the max cost for a
+// 3.7MB stream is far below 2^31, so additions never overflow).
+const DP_INF = 0xffffffff;
+
+function makeDPWorkspace(maxN) {
+  return {
+    same: new Uint16Array(maxN),
+    head1: new Int32Array(1 << 15).fill(-1),
+    prev1: new Int32Array(maxN),
+    head2: new Int32Array(1 << 15).fill(-1),
+    prev2: new Int32Array(maxN),
+    stepOff: new Uint32Array(maxN + 1),
+    stepPack: new Uint32Array(Math.max(1024, maxN * 2)),
+    cost: new Uint32Array(maxN + 1),
+    pathLen: new Uint16Array(maxN + 1),
+    pathDist: new Uint16Array(maxN + 1),
+  };
+}
+
+// Build the LZ77 sublen-step cache (Carbon P1): for each position, the list of
+// (dist, startLen, endLen) steps, where each step says "a match of any length
+// in [startLen, endLen] is achievable at this dist, and startLen is one past
+// the previous best length for a shorter dist". Dual hash chains (prev1 on the
+// 3-byte prefix, prev2 on the run structure) skip the flood of 0,0,0 prefixes
+// with zero missed solutions. stepBudget is a deterministic cap on total
+// hash-chain steps (no clock). `data` must have >=258 bytes of zero padding
+// past n so getUint32/hash reads never run off the end.
+function buildMatchCache(data, n, maxChain, stepBudget, ws) {
+  const { same, head1, prev1, head2, prev2, stepOff } = ws;
+  let stepPack = ws.stepPack;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  same[n - 1] = 1;
+  for (let i = n - 2; i >= 0; i--) {
+    same[i] = data[i] === data[i + 1] ? (same[i + 1] < 258 ? same[i + 1] + 1 : 258) : 1;
+  }
+  head1.fill(-1);
+  head2.fill(-1);
+  let stepCount = 0;
+  let usedChainOps = 0;
+  const ensure = (need) => {
+    if (stepCount + need > stepPack.length) {
+      const grown = new Uint32Array(Math.max(stepPack.length * 2, stepCount + need));
+      grown.set(stepPack.subarray(0, stepCount));
+      ws.stepPack = grown;
+      stepPack = grown;
+    }
+  };
+  for (let i = 0; i < n; i++) {
+    stepOff[i] = stepCount;
+    const slot = i & 32767;
+    const sLen = same[i];
+    const nextB = i + sLen < n ? data[i + sLen] : 0;
+    const h1 = (((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) * 0x9e3779b1) >>> 17;
+    const h2 = (((sLen << 16) ^ (data[i] << 8) ^ nextB) * 0x85ebca6b) >>> 17;
+    prev1[slot] = head1[h1];
+    head1[h1] = i;
+    prev2[slot] = head2[h2];
+    head2[h2] = i;
+    const maxL = n - i < 258 ? n - i : 258;
+    if (maxL < 3) continue;
+    if (i > 0 && data[i] === data[i - 1] && sLen === 258 && maxL === 258) {
+      ensure(1);
+      stepPack[stepCount++] = (1 << 16) | (3 << 8) | (258 - 3);
+      continue;
+    }
+    const remPos = n - i;
+    let dynLimit = ((stepBudget - usedChainOps) / remPos) | 0;
+    if (dynLimit > maxChain) dynLimit = maxChain;
+    else if (dynLimit < 8) dynLimit = 8;
+    const limit = dynLimit;
+    let bestLen = 2;
+    let p = prev1[slot];
+    let usingHash2 = false;
+    const minPos = i > 32768 ? i - 32768 : 0;
+    for (let steps = 0; p >= minPos && steps < limit; steps++) {
+      usedChainOps++;
+      if (data[p + bestLen] === data[i + bestLen]) {
+        let len = 0;
+        while (len + 4 <= maxL && dv.getUint32(p + len, true) === dv.getUint32(i + len, true)) len += 4;
+        while (len < maxL && data[p + len] === data[i + len]) len++;
+        if (len > bestLen) {
+          const dist = i - p;
+          const startL = bestLen + 1;
+          ensure(1);
+          // startL can be 258; clamp to 255 (lengths 255..258 are all valid
+          // for this dist once len=258 is reachable, so no solution is lost).
+          const sL = startL > 255 ? 255 : startL;
+          stepPack[stepCount++] = (dist << 16) | (sL << 8) | (len - 3);
+          bestLen = len;
+          if (bestLen === maxL) break;
+        }
+      }
+      if (!usingHash2 && bestLen >= sLen && sLen < 258 && i + sLen < n) {
+        // Switch to the hash2 chain: continue from the head of THIS position's
+        // hash2 chain (prev2[i]), not from prev2[p] — p's run structure is
+        // only guaranteed to match i's when p itself produced the long match,
+        // but bestLen may come from an earlier candidate.
+        usingHash2 = true;
+        p = prev2[slot];
+      } else {
+        p = usingHash2 ? prev2[p & 32767] : prev1[p & 32767];
+      }
+    }
+  }
+  stepOff[n] = stepCount;
+  return stepCount;
+}
+
+// Forward DP over the whole stream using the match cache and per-block Huffman
+// cost tables (fixed point, 1/64 bit). blockOf[i] is the block of byte i.
+// Returns cost[n] (total bits * 64). pathLen/pathDist (in ws) hold the token
+// ending at each position for backtracking.
+function runGlobalDP(data, n, blockOf, stepOff, stepPack, litCost, lenCost, distCost, ws) {
+  const { cost, pathLen, pathDist } = ws;
+  cost.fill(DP_INF, 1, n + 1);
+  cost[0] = 0;
+  for (let i = 0; i < n; i++) {
+    const cur = cost[i];
+    if (cur === DP_INF) continue;
+    const b = blockOf[i];
+    const litC = cur + litCost[(b << 8) | data[i]];
+    if (litC < cost[i + 1]) {
+      cost[i + 1] = litC;
+      pathLen[i + 1] = 1;
+      pathDist[i + 1] = 0;
+    }
+    const sBeg = stepOff[i];
+    const sEnd = stepOff[i + 1];
+    const lenBase = b * 259;
+    const distBase = b * 32769;
+    for (let s = sBeg; s < sEnd; s++) {
+      const packed = stepPack[s];
+      const dist = packed >>> 16;
+      const startL = (packed >>> 8) & 0xff;
+      const endL = (packed & 0xff) + 3;
+      const baseCost = cur + distCost[distBase + dist];
+      for (let k = startL; k <= endL; k++) {
+        const c = baseCost + lenCost[lenBase + k];
+        if (c < cost[i + k]) {
+          cost[i + k] = c;
+          pathLen[i + k] = k;
+          pathDist[i + k] = dist;
+        }
+      }
+    }
+  }
+  return cost[n];
+}
+
+function backtrackTokens(data, n, pathLen, pathDist) {
+  const rev = [];
+  let j = n;
+  while (j > 0) {
+    const len = pathLen[j];
+    const dist = pathDist[j];
+    if (len <= 1) {
+      rev.push(data[j - 1]);
+      j -= 1;
+    } else {
+      rev.push({ len, dist });
+      j -= len;
+    }
+  }
+  rev.reverse();
+  return rev;
+}
+
+// Per-block Huffman cost tables (fixed point) from per-block Huffman lengths.
+// litCost[b*256+byte], lenCost[b*259+len] (len 0..258, raw length),
+// distCost[b*32769+dist].
+function buildCostTables(numBlocks, litLensArr, distLensArr) {
+  const litCost = new Uint32Array(numBlocks * 256);
+  const lenCost = new Uint32Array(numBlocks * 259);
+  const distCost = new Uint32Array(numBlocks * 32769);
+  for (let b = 0; b < numBlocks; b++) {
+    const ll = litLensArr[b];
+    const dl = distLensArr[b];
+    for (let byte = 0; byte < 256; byte++) {
+      litCost[b * 256 + byte] = (ll[byte] > 0 ? ll[byte] : 15) * 64;
+    }
+    for (let len = 0; len < 259; len++) {
+      const lc = lenCodeOf(len);
+      const l = ll[257 + lc] > 0 ? ll[257 + lc] : 15;
+      lenCost[b * 259 + len] = (l + LEN_EXTRA[lc]) * 64;
+    }
+    for (let dist = 0; dist < 32769; dist++) {
+      const dc = distCodeOf(dist);
+      const d = dl[dc] > 0 ? dl[dc] : 15;
+      distCost[b * 32769 + dist] = (d + DIST_EXTRA[dc]) * 64;
+    }
+  }
+  return { litCost, lenCost, distCost };
+}
+
+// Emit the DP token list as a zlib stream, one DEFLATE block per block index
+// (tokens grouped by the block of their start position; dynamic vs fixed per
+// block, smaller wins). Returns {bytes, litFreqArr, distFreqArr}.
+function emitGlobal(data, tokens, blockOf, numBlocks) {
+  const blockTokens = Array.from({ length: numBlocks }, () => []);
+  const litFreqArr = Array.from({ length: numBlocks }, () => new Float64Array(288));
+  const distFreqArr = Array.from({ length: numBlocks }, () => new Float64Array(30));
+  let pos = 0;
+  for (const t of tokens) {
+    const b = blockOf[pos];
+    blockTokens[b].push(t);
+    if (typeof t === 'number') {
+      litFreqArr[b][t]++;
+      pos += 1;
+    } else {
+      litFreqArr[b][257 + lenCodeOf(t.len)]++;
+      distFreqArr[b][distCodeOf(t.dist)]++;
+      pos += t.len;
+    }
+  }
+  for (let b = 0; b < numBlocks; b++) litFreqArr[b][256]++;
+  const bw = new BitWriter();
+  for (let b = 0; b < numBlocks; b++) {
+    const isFinal = b === numBlocks - 1;
+    const dyn = buildDynamic(litFreqArr[b], distFreqArr[b]);
+    const bwD = new BitWriter();
+    emitDynamicBlock(bwD, blockTokens[b], dyn, isFinal);
+    const dynBytes = bwD.finish();
+    const bwF = new BitWriter();
+    emitFixedBlock(bwF, blockTokens[b], isFinal);
+    const fixBytes = bwF.finish();
+    if (dynBytes.length <= fixBytes.length) emitDynamicBlock(bw, blockTokens[b], dyn, isFinal);
+    else emitFixedBlock(bw, blockTokens[b], isFinal);
+  }
+  const best = bw.finish();
+  const out = new Uint8Array(2 + best.length + 4);
+  out[0] = 0x78; out[1] = 0x9c;
+  out.set(best, 2);
+  new DataView(out.buffer).setUint32(2 + best.length, adler32(data));
+  return { bytes: out, litFreqArr, distFreqArr };
+}
+
+// Deterministic xorshift32 PRNG (fixed seed; no clock, no Math.random).
+function makeXorshift(seed) {
+  let s = seed >>> 0 || 1;
+  return () => {
+    s ^= s << 13; s ^= s >>> 17; s ^= s << 5;
+    return s >>> 0;
+  };
+}
+
+// Top-level v3 encoder: match cache once + fixed blocks + iterative global DP
+// with deterministic perturbation. Returns a zlib stream (Uint8Array).
+// opts: blockSize (default 262144), maxChain (default 256), stepBudgetPerByte
+// (default 64), maxRounds (default 8).
+export function deflateGlobalDP(data, opts = {}) {
+  const n = data.length;
+  const blockSize = opts.blockSize ?? 262144;
+  const maxChain = opts.maxChain ?? 512;
+  const stepBudget = (opts.stepBudgetPerByte ?? 256) * n;
+  const maxRounds = opts.maxRounds ?? 8;
+  const numBlocks = Math.max(1, Math.ceil(n / blockSize));
+  const blockOf = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    const b = (i / blockSize) | 0;
+    blockOf[i] = b < numBlocks ? b : numBlocks - 1;
+  }
+  const padded = new Uint8Array(n + 258);
+  padded.set(data);
+  const ws = makeDPWorkspace(n);
+  buildMatchCache(padded, n, maxChain, stepBudget, ws);
+  const rng = makeXorshift(0x9e3779b9);
+  let litLensArr = Array.from({ length: numBlocks }, () => FIXED_LIT_LEN);
+  let distLensArr = Array.from({ length: numBlocks }, () => FIXED_DIST_LEN);
+  let litFreqArr = null;
+  let distFreqArr = null;
+  let best = null;
+  let bestBytes = Infinity;
+  let stall = 0;
+  for (let round = 0; round < maxRounds; round++) {
+    let llArr = litLensArr;
+    let dlArr = distLensArr;
+    if (round >= 4 && stall >= 2 && litFreqArr !== null) {
+      // Deterministic perturbation of the frequencies to escape local optima.
+      llArr = litFreqArr.map((f) => {
+        const pf = new Float64Array(288);
+        for (let i = 0; i < 288; i++) {
+          pf[i] = f[i] > 0 ? (f[i] * (100 + (rng() % 45)) / 128) : 0;
+        }
+        return huffmanLengths(pf, 15);
+      });
+      dlArr = distFreqArr.map((f) => {
+        const pf = new Float64Array(30);
+        for (let i = 0; i < 30; i++) {
+          pf[i] = f[i] > 0 ? (f[i] * (100 + (rng() % 45)) / 128) : 0;
+        }
+        let d = huffmanLengths(pf, 15);
+        if (pf.every((x) => x === 0)) { d = new Uint8Array(30); d[0] = 1; }
+        return d;
+      });
+    }
+    const { litCost, lenCost, distCost } = buildCostTables(numBlocks, llArr, dlArr);
+    runGlobalDP(padded, n, blockOf, ws.stepOff, ws.stepPack, litCost, lenCost, distCost, ws);
+    const tokens = backtrackTokens(padded, n, ws.pathLen, ws.pathDist);
+    const { bytes, litFreqArr: lf, distFreqArr: df } = emitGlobal(data, tokens, blockOf, numBlocks);
+    if (bytes.length < bestBytes) {
+      bestBytes = bytes.length;
+      best = bytes;
+      stall = 0;
+    } else {
+      stall++;
+    }
+    litFreqArr = lf;
+    distFreqArr = df;
+    litLensArr = lf.map((f) => huffmanLengths(f, 15));
+    distLensArr = df.map((f) => {
+      const d = huffmanLengths(f, 15);
+      if (f.every((x) => x === 0)) { const z = new Uint8Array(30); z[0] = 1; return z; }
+      return d;
+    });
+    if (round >= 5 && stall >= 3) break;
+  }
+  return best;
+}
+
 // Same as deflateOptimalBlocks but the per-block parse is the DP optimal parse
 // (tokenizeDP) instead of greedy+lazy. dpChain bounds the hash-chain walk per
 // DP position (the DP calls the matcher at every offset, so it must stay

@@ -7,7 +7,7 @@
 import { deflateSync, inflateSync, constants } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deflateOptimalBlocks, deflateOptimalBlocksDP } from './deflate.ts';
+import { deflateGlobalDP } from './deflate.ts';
 
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -203,7 +203,122 @@ function paletteForm(rgba, colours, order) {
   for (let i = 0, d = 0; i < n; i++, d += 4) {
     indices[i] = index.get(((rgba[d] << 24) | (rgba[d + 1] << 16) | (rgba[d + 2] << 8) | rgba[d + 3]) >>> 0);
   }
-  return { plte, trns, indices };
+  return { plte, trns, indices, entries };
+}
+
+// Astra palette-alias: for images whose tiles are mostly background + one ink
+// colour, build a paired palette (background duplicated once per ink, tile
+// pixels use two adjacent indices) so whole-image Sub/Up filters compress the
+// tile edges better. Returns null when no tile qualifies.
+function makeAliasCandidate(indices, palette, width, height, tileSize = 16) {
+  if (!Number.isSafeInteger(width) || width < 1 ||
+      !Number.isSafeInteger(height) || height < 1 ||
+      width * height !== indices.length ||
+      !Number.isSafeInteger(tileSize) || tileSize < 2) {
+    throw new RangeError('Invalid raster dimensions or tile size');
+  }
+  const colors = palette.length;
+  if (colors < 1 || colors > 256) throw new RangeError('Invalid palette size');
+  if (colors < 3 || colors === 256) return null;
+  const frequency = new Uint32Array(colors);
+  for (let i = 0; i < indices.length; i++) {
+    const index = indices[i];
+    if (index >= colors) throw new RangeError('Pixel index exceeds palette size');
+    frequency[index]++;
+  }
+  let background = 0;
+  for (let c = 1; c < colors; c++) {
+    if (frequency[c] > frequency[background]) background = c;
+  }
+  const across = Math.ceil(width / tileSize);
+  const down = Math.ceil(height / tileSize);
+  const tileInk = new Int16Array(across * down).fill(-1);
+  const transitions = new Uint32Array(colors);
+  for (let ty = 0; ty < down; ty++) {
+    const bottom = Math.min(height, (ty + 1) * tileSize);
+    for (let tx = 0; tx < across; tx++) {
+      const left = tx * tileSize;
+      const right = Math.min(width, left + tileSize);
+      let ink = -1;
+      let edges = 0;
+      let eligible = true;
+      for (let y = ty * tileSize; y < bottom && eligible; y++) {
+        const row = y * width;
+        let previous = indices[row + left];
+        for (let x = left; x < right; x++) {
+          const c = indices[row + x];
+          if (c !== background) {
+            if (ink < 0) ink = c;
+            if (c !== ink) {
+              eligible = false;
+              break;
+            }
+          }
+          if (previous !== c) edges++;
+          previous = c;
+        }
+      }
+      if (eligible && edges > 0) {
+        tileInk[ty * across + tx] = ink;
+        transitions[ink] += edges;
+      }
+    }
+  }
+  const inks = Array.from({ length: colors }, (_, c) => c)
+    .filter((c) => transitions[c] > 0)
+    .sort((a, b) => transitions[b] - transitions[a] || a - b)
+    .slice(0, 257 - colors);
+  if (inks.length < 2) return null;
+  const alias = new Int16Array(colors).fill(-1);
+  const normal = new Uint8Array(colors);
+  const entries = [];
+  for (const ink of inks) {
+    alias[ink] = entries.length;
+    normal[ink] = entries.length + 1;
+    entries.push(palette[background], palette[ink]);
+  }
+  normal[background] = 0;
+  for (let c = 0; c < colors; c++) {
+    if (c !== background && alias[c] < 0) {
+      normal[c] = entries.length;
+      entries.push(palette[c]);
+    }
+  }
+  const encoded = new Uint8Array(indices.length);
+  for (let ty = 0; ty < down; ty++) {
+    const bottom = Math.min(height, (ty + 1) * tileSize);
+    for (let tx = 0; tx < across; tx++) {
+      const ink = tileInk[ty * across + tx];
+      const base = ink < 0 ? -1 : alias[ink];
+      const left = tx * tileSize;
+      const right = Math.min(width, left + tileSize);
+      for (let y = ty * tileSize; y < bottom; y++) {
+        let pos = y * width + left;
+        const end = pos + right - left;
+        if (base < 0) {
+          for (; pos < end; pos++) encoded[pos] = normal[indices[pos]];
+        } else {
+          for (; pos < end; pos++) encoded[pos] = base + Number(indices[pos] !== background);
+        }
+      }
+    }
+  }
+  return { indices: encoded, palette: Uint32Array.from(entries), pairedColors: inks.length };
+}
+
+// Convert a Uint32Array palette (words (R<<24)|(G<<16)|(B<<8)|A) to PLTE + tRNS.
+function plteTrnsFromWords(words) {
+  const plte = new Uint8Array(words.length * 3);
+  let transparent = 0;
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    plte[i * 3] = (w >>> 24) & 0xff;
+    plte[i * 3 + 1] = (w >>> 16) & 0xff;
+    plte[i * 3 + 2] = (w >>> 8) & 0xff;
+    if ((w & 0xff) !== 255) transparent = i + 1;
+  }
+  const trns = transparent === 0 ? null : Uint8Array.from(words.slice(0, transparent), (w) => w & 0xff);
+  return { plte, trns };
 }
 
 // ---- Filters ----
@@ -252,6 +367,27 @@ function pairsOf(row, seen, stamp) {
   return n;
 }
 
+// Shannon entropy of a row's bytes, in bits/byte. Precomputed c*log2(c) table
+// makes this a histogram + a sum over distinct bytes (no log2 in the loop).
+// Minimising entropy is the right objective for DEFLATE: a row of [1,1,1,...]
+// has entropy 0 but a large minsum, so minsum misjudges linear gradients.
+const LOG2C = (() => {
+  const t = new Float64Array(5121);
+  for (let c = 1; c <= 5120; c++) t[c] = c * Math.log2(c);
+  return t;
+})();
+function entropyOf(row) {
+  const n = row.length;
+  const freq = new Uint32Array(256);
+  for (let i = 0; i < n; i++) freq[row[i]]++;
+  let s = 0;
+  for (let c = 0; c < 256; c++) {
+    const f = freq[c];
+    if (f) s += LOG2C[f];
+  }
+  return Math.log2(n) - s / n;
+}
+
 // Filtered data for one form under one choice: fixed filter 0-4, 'minsum', 'pairs', 'brute'.
 function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(height * (width * bpp + 1))) {
   const stride = width * bpp;
@@ -276,6 +412,7 @@ function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(heig
       let cost;
       if (choice === 'minsum') cost = signedSum(trial[t].subarray(1));
       else if (choice === 'pairs') cost = pairsOf(trial[t].subarray(1), seen, ++stamp);
+      else if (choice === 'entropy') cost = entropyOf(trial[t].subarray(1));
       else cost = deflateSync(trial[t], before.length === 0 ? { level: BRUTE_LEVEL, memLevel: 9 } : { level: BRUTE_LEVEL, memLevel: 9, dictionary: before }).length;
       if (cost < best) {
         best = cost;
@@ -289,11 +426,11 @@ function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(heig
 
 const FILTERS = Object.freeze({
   palette: Object.freeze([0]),
-  paletteByLuminance: Object.freeze([0, 'minsum', 'brute']),
-  channels: Object.freeze([0, 1, 2, 4, 'minsum', 'pairs', 'brute']),
+  paletteByLuminance: Object.freeze([0, 'minsum', 'brute', 'entropy']),
+  channels: Object.freeze([0, 1, 2, 4, 'minsum', 'pairs', 'brute', 'entropy']),
 });
 
-function formsOf(rgba) {
+function formsOf(rgba, width, height) {
   const { opaque, grey, colours } = analyse(rgba);
   const forms = [];
   if (colours !== null) {
@@ -303,8 +440,22 @@ function formsOf(rgba) {
     ]) {
       const p = paletteForm(rgba, colours, order);
       forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns, filters });
+      if (order === 'count') {
+        // Astra palette-alias: paired palette, whole-image Sub/Up filters.
+        try {
+          const paletteWords = Uint32Array.from(p.entries, (e) => e.word);
+          const alias = makeAliasCandidate(p.indices, paletteWords, width, height, 16);
+          if (alias) {
+            const at = plteTrnsFromWords(alias.palette);
+            forms.push({ colourType: 3, bpp: 1, samples: alias.indices, plte: at.plte, trns: at.trns, filters: [1, 2] });
+          }
+        } catch { /* alias not applicable for this image */ }
+      }
     }
-    if (!grey) return forms;
+    // Carbon P3: let the RGB/RGBA channel form compete against Palette even
+    // for non-grey images with <=256 colours (smooth gradients / anti-aliased
+    // edges can compress better as channels than as indices).
+    // (No early return: fall through to add the channel form below.)
   }
   const key = opaque ? null : transparentKey(rgba, grey);
   let ct;
@@ -327,7 +478,7 @@ const chunkBytes = (form) => (form.plte === null ? 0 : 12 + form.plte.length) + 
 function screen(rgba, width, height) {
   let best = null;
   let spare = null;
-  for (const form of formsOf(rgba)) {
+  for (const form of formsOf(rgba, width, height)) {
     const size = height * (width * form.bpp + 1);
     const chunks = chunkBytes(form);
     for (const choice of form.filters) {
@@ -361,50 +512,28 @@ for (const id of readdirSync(I).sort()) {
   if (process.env.DUMP_FILTERED) writeFileSync(`/tmp/filtered-${id}.bin`, data);
   if (process.env.PNG_SQUEEZE_TIMING) console.error(`[screen] ${id} colourType=${form.colourType} bpp=${form.bpp} choice=${String(choice)}`);
   const tScreen = Date.now() - tId;
-  // Cheap extra (Astra): sweep zlib strategies at level 9 — Z_FILTERED favours
-  // matches on filtered data, Z_RLE wins on runs, Z_FIXED on tiny alphabets.
-  // Try memLevel 8 (the known-good baseline) and 9; native calls, ~ms each.
+  // zlib level-9 fallback (Carbon: Z_HUFFMAN_ONLY and Z_FIXED always lose on
+  // filtered screenshots, so only DEFAULT / FILTERED / RLE at memLevel 9).
   let best = null;
-  for (const memLevel of [8, 9]) {
-    for (const strategy of [constants.Z_DEFAULT_STRATEGY, constants.Z_FILTERED, constants.Z_RLE, constants.Z_FIXED, constants.Z_HUFFMAN_ONLY]) {
-      const s = deflateSync(data, { level: 9, memLevel, strategy });
-      const u = new Uint8Array(s.buffer, s.byteOffset, s.length);
-      if (best === null || u.length < best.length) best = u;
-    }
+  for (const strategy of [constants.Z_DEFAULT_STRATEGY, constants.Z_FILTERED, constants.Z_RLE]) {
+    const s = deflateSync(data, { level: 9, memLevel: 9, strategy });
+    const u = new Uint8Array(s.buffer, s.byteOffset, s.length);
+    if (best === null || u.length < best.length) best = u;
   }
-  // Optimal-parse DEFLATE (zopfli-style, written from scratch in deflate.ts):
-  // 128 KiB and 256 KiB blocks, each with its own Huffman table, hash chains
-  // searched to depth 4096 (the probe showed maxChain 4096 beats 1024 on
-  // every instance, and 256 KiB wins on 5/8 while 128 KiB wins on 2/8).
-  const b128 = deflateOptimalBlocks(data, 131072, 4096, 258, 2);
-  if (b128.length < best.length) best = b128;
-  const b256 = deflateOptimalBlocks(data, 262144, 4096, 258, 2);
-  if (b256.length < best.length) best = b256;
-  // DP optimal parse (Gemini-web/ChatGPT-web Phase 3), targeted by stream size
-  // AND filter type so the deep-chain DP stays inside the 60 s budget.
-  // Measured deltas vs the best greedy/zlib stream on the practice set
-  // (b256k): small instances (<=1.15 MB) gain 549/5234/867/1238 bytes at
-  // chain 1024. The larger instances gain 1325/4832/6094/967 bytes at
-  // chain 512 (on i006 chain 512 is only 27 bytes worse than chain 1024
-  // and 28% faster) — but only the adaptive-filter ones (brute/pairs/
-  // minsum) are worth it: fixed-None instances gain far less per second,
-  // so they skip the DP.
-  if (data.length <= 1150000) {
-    const dp256 = deflateOptimalBlocksDP(data, 262144, 1024, 258, 2);
-    if (dp256.length < best.length) best = dp256;
-  } else if (data.length <= 3900000 && typeof choice === 'string') {
-    const dp256 = deflateOptimalBlocksDP(data, 262144, 512, 258, 2);
-    if (dp256.length < best.length) best = dp256;
-  }
+  // Global DP (Carbon P1+P2): match cache + dual-hash + full sublen steps,
+  // whole-stream forward DP with per-block Huffman cost tables, iterative
+  // refinement with deterministic perturbation. Runs on every winning stream.
+  const gdp = deflateGlobalDP(data);
+  if (gdp.length < best.length) best = gdp;
   if (process.env.PNG_SQUEEZE_PROBE_FILTERS) {
     // For the winning form, show every filter choice's zlib-6 AND optimal size:
     // the screen picks by zlib-6, but the final encoding is the optimal parser.
     for (const ch of form.filters) {
       const d = filtered(form.samples, image.width, image.height, form.bpp, ch);
       const z6 = deflateSync(d, SCREEN).length;
-      const opt = deflateOptimalBlocks(d, 131072, 1024, 258, 2).length;
+      const opt = deflateGlobalDP(d).length;
       const z9 = deflateSync(d, FINAL).length;
-      console.error(`[probe] ${id} ct=${form.colourType} choice=${String(ch)} zlib6=${z6} zlib9=${z9} opt128=${opt}`);
+      console.error(`[probe] ${id} ct=${form.colourType} choice=${String(ch)} zlib6=${z6} zlib9=${z9} globalDP=${opt}`);
     }
   }
   if (process.env.PNG_SQUEEZE_TIMING) {
