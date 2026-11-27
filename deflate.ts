@@ -1071,12 +1071,14 @@ function mdlBlockSplit(data, n, stepOff, stepPack) {
 // Top-level v3 encoder: match cache once + fixed blocks + iterative global DP
 // with deterministic perturbation. Returns a zlib stream (Uint8Array).
 // opts: blockSize (default 262144), maxChain (default 256), stepBudgetPerByte
-// (default 64), maxRounds (default 8).
+// (default 64), maxRounds (default 4 — V5: cut from 8 for timeout safety;
+// measured: 8 rounds = 776,982 @ 43.65s on 猫猫, 4 rounds = 775,786 @ 30.77s,
+// only -1,196 pts for -13.7s; maxChain stays 512, chain 256 lost 2,625 pts).
 export function deflateGlobalDP(data, opts = {}) {
   const n = data.length;
   const maxChain = opts.maxChain ?? 512;
   const stepBudget = (opts.stepBudgetPerByte ?? 256) * n;
-  const maxRounds = opts.maxRounds ?? 8;
+  const maxRounds = opts.maxRounds ?? 4;
   const padded = new Uint8Array(n + 258);
   padded.set(data);
   const ws = makeDPWorkspace(n);

@@ -597,6 +597,7 @@ for (const id of readdirSync(I).sort()) {
   // whole-stream forward DP with per-block Huffman cost tables, iterative
   // refinement with deterministic perturbation. Runs on every winning stream.
   // MDL dynamic blocks are always on inside deflateGlobalDP.
+  // V5: maxRounds defaults to 4 in deflate.ts (timeout safety; see there).
   const gdp = deflateGlobalDP(data);
   if (gdp.length < best.length) best = gdp;
   if (process.env.PNG_SQUEEZE_PROBE_FILTERS) {
