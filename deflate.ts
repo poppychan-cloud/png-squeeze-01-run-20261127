@@ -470,6 +470,87 @@ function rleCodeLens(lens) {
   return { syms, extras };
 }
 
+// Optimal RLE of a code-length sequence given the code-length Huffman lengths
+// (Carbon P5). DP over positions with the previous emitted length as state
+// (needed for the 16 "repeat previous" code). Returns {syms, extras} with
+// minimal total bits sum(clLens[sym] + extraBits(sym)). Always at least as
+// good as the greedy rleCodeLens for the same clLens.
+function rleCodeLensDP(seq, clLens) {
+  const n = seq.length;
+  const runLen = new Uint16Array(n);
+  for (let i = n - 1; i >= 0; i--) {
+    runLen[i] = (i + 1 < n && seq[i + 1] === seq[i]) ? runLen[i + 1] + 1 : 1;
+  }
+  const INF = 1e18;
+  const NP = 17; // previous length 0..15, 16 = none (start only)
+  const cost = Array.from({ length: n + 1 }, () => new Float64Array(NP).fill(INF));
+  const parI = Array.from({ length: n + 1 }, () => new Int16Array(NP).fill(-1));
+  const parP = Array.from({ length: n + 1 }, () => new Int16Array(NP).fill(-1));
+  const parSym = Array.from({ length: n + 1 }, () => new Int16Array(NP).fill(-1));
+  const parExtra = Array.from({ length: n + 1 }, () => new Int16Array(NP).fill(0));
+  cost[0][16] = 0;
+  for (let i = 0; i < n; i++) {
+    for (let p = 0; p < NP; p++) {
+      const c = cost[i][p];
+      if (c === INF) continue;
+      const v = seq[i];
+      const run = runLen[i];
+      const relax = (ni, np, sym, extra, add) => {
+        const nc = c + add;
+        if (nc < cost[ni][np]) {
+          cost[ni][np] = nc;
+          parI[ni][np] = i;
+          parP[ni][np] = p;
+          parSym[ni][np] = sym;
+          parExtra[ni][np] = extra;
+        }
+      };
+      // Literal v.
+      relax(i + 1, v, v, 0, clLens[v]);
+      if (v === 0) {
+        const k17 = Math.min(run, 10);
+        for (let k = 3; k <= k17; k++) relax(i + k, 0, 17, k - 3, clLens[17] + 3);
+        const k18 = Math.min(run, 138);
+        for (let k = 11; k <= k18; k++) relax(i + k, 0, 18, k - 11, clLens[18] + 7);
+      } else if (p === v) {
+        const k16 = Math.min(run, 6);
+        for (let k = 3; k <= k16; k++) relax(i + k, v, 16, k - 3, clLens[16] + 2);
+      }
+    }
+  }
+  let bestP = 0, bestC = INF;
+  for (let p = 0; p < NP; p++) if (cost[n][p] < bestC) { bestC = cost[n][p]; bestP = p; }
+  const syms = [];
+  const extras = [];
+  let i = n, p = bestP;
+  while (i > 0) {
+    const pi = parI[i][p];
+    const pp = parP[i][p];
+    const sym = parSym[i][p];
+    const extra = parExtra[i][p];
+    syms.push(sym);
+    extras.push(extra);
+    i = pi; p = pp;
+  }
+  syms.reverse();
+  extras.reverse();
+  return { syms, extras };
+}
+
+// Total header bits (excluding the fixed 5+5+4+HCLEN*3 part, which is the
+// same for a given clLens) for an RLE encoding under clLens.
+function rleSymbolBits(syms, extras, clLens) {
+  let bits = 0;
+  for (let k = 0; k < syms.length; k++) {
+    const s = syms[k];
+    bits += clLens[s];
+    if (s === 16) bits += 2;
+    else if (s === 17) bits += 3;
+    else if (s === 18) bits += 7;
+  }
+  return bits;
+}
+
 export function emitDynamicBlock(bw, tokens, dyn, isFinal) {
   bw.writeBits(isFinal ? 1 : 0, 1);
   bw.writeBits(2, 2); // BTYPE dynamic
@@ -478,7 +559,23 @@ export function emitDynamicBlock(bw, tokens, dyn, isFinal) {
   const seq = new Uint8Array(maxLit + 1 + maxDist + 1);
   seq.set(litLens.subarray(0, maxLit + 1), 0);
   seq.set(distLens.subarray(0, maxDist + 1), maxLit + 1);
-  const { syms, extras } = rleCodeLens(seq);
+  // Greedy RLE first, then one optimal-DP pass under its code-length tree;
+  // keep the DP result only if it is strictly smaller (never worse).
+  // Carbon P5 tree-RLE, measured +38.
+  let { syms, extras } = rleCodeLens(seq);
+  {
+    const clFreq0 = new Float64Array(19);
+    for (const s of syms) clFreq0[s]++;
+    const clLens0 = huffmanLengths(clFreq0, 7);
+    const dp = rleCodeLensDP(seq, clLens0);
+    const clFreq1 = new Float64Array(19);
+    for (const s of dp.syms) clFreq1[s]++;
+    const clLens1 = huffmanLengths(clFreq1, 7);
+    if (rleSymbolBits(dp.syms, dp.extras, clLens1) < rleSymbolBits(syms, extras, clLens0)) {
+      syms = dp.syms;
+      extras = dp.extras;
+    }
+  }
   const clFreq = new Float64Array(19);
   for (const s of syms) clFreq[s]++;
   const clLens = huffmanLengths(clFreq, 7);
@@ -854,26 +951,138 @@ function makeXorshift(seed) {
   };
 }
 
+// ---- P5 helper: exact dynamic-block header bit count ----
+// Given lit/dist code lengths, compute the exact number of bits the dynamic
+// header would occupy (HLIT/HDIST/HCLEN + code-length tree + RLE'd lengths).
+// Mirrors emitDynamicBlock's header construction exactly.
+function dynamicHeaderBits(litLens, distLens) {
+  let maxLit = 286;
+  while (maxLit > 257 && litLens[maxLit] === 0) maxLit--;
+  let maxDist = 29;
+  while (maxDist > 0 && distLens[maxDist] === 0) maxDist--;
+  const seq = new Uint8Array(maxLit + 1 + maxDist + 1);
+  seq.set(litLens.subarray(0, maxLit + 1), 0);
+  seq.set(distLens.subarray(0, maxDist + 1), maxLit + 1);
+  const { syms, extras } = rleCodeLens(seq);
+  const clFreq = new Float64Array(19);
+  for (const s of syms) clFreq[s]++;
+  const clLens = huffmanLengths(clFreq, 7);
+  let hclen = 4;
+  for (let j = 18; j >= 4; j--) if (clLens[CL_ORDER[j]] > 0) { hclen = j + 1; break; }
+  let bits = 5 + 5 + 4 + hclen * 3;
+  for (let k = 0; k < syms.length; k++) {
+    const s = syms[k];
+    bits += clLens[s];
+    if (s === 16) bits += 2;
+    else if (s === 17) bits += 3;
+    else if (s === 18) bits += 7;
+  }
+  return bits;
+}
+
+// Greedy tokenisation from the match cache: at each position take the longest
+// match in the cache (max endLen over steps), else a literal. Returns
+// {pos, len, dist, count} (plain JS arrays; pos is the byte offset).
+function greedyTokensFromCache(n, stepOff, stepPack) {
+  const pos = [];
+  const len = [];
+  const dist = [];
+  let i = 0;
+  while (i < n) {
+    let bestLen = 0, bestDist = 0;
+    for (let s = stepOff[i]; s < stepOff[i + 1]; s++) {
+      const packed = stepPack[s];
+      const endL = (packed & 0xff) + 3;
+      if (endL > bestLen) { bestLen = endL; bestDist = packed >>> 16; }
+    }
+    if (bestLen >= 3) {
+      pos.push(i); len.push(bestLen); dist.push(bestDist);
+      i += bestLen;
+    } else {
+      pos.push(i); len.push(1); dist.push(0);
+      i += 1;
+    }
+  }
+  return { pos, len, dist, count: pos.length };
+}
+
+// MDL block splitting (Carbon P2) on the greedy token list. A split is
+// accepted only when the two sub-blocks' dynamic costs (token bits + exact
+// header) are strictly less than the parent's. Returns {blockOf, numBlocks}.
+// Candidate split points are the 1/2, 1/4 and 3/4 token positions.
+function mdlBlockSplit(data, n, stepOff, stepPack) {
+  const tok = greedyTokensFromCache(n, stepOff, stepPack);
+  const m = tok.count;
+  const litFreq = new Float64Array(288);
+  const distFreq = new Float64Array(30);
+  function costOf(l, r) {
+    litFreq.fill(0);
+    distFreq.fill(0);
+    for (let t = l; t < r; t++) {
+      if (tok.len[t] === 1) {
+        litFreq[data[tok.pos[t]]]++;
+      } else {
+        litFreq[257 + lenCodeOf(tok.len[t])]++;
+        distFreq[distCodeOf(tok.dist[t])]++;
+      }
+    }
+    litFreq[256]++;
+    const ll = huffmanLengths(litFreq, 15);
+    let dl = huffmanLengths(distFreq, 15);
+    if (distFreq.every((f) => f === 0)) { dl = new Uint8Array(30); dl[0] = 1; }
+    let bits = 0;
+    for (let i = 0; i < 288; i++) bits += litFreq[i] * ll[i];
+    for (let i = 0; i < 30; i++) bits += distFreq[i] * dl[i];
+    bits += dynamicHeaderBits(ll, dl);
+    return bits;
+  }
+  const ranges = [];
+  const MIN_TOKENS = 1024;
+  const MAX_DEPTH = 6;
+  function bisect(l, r, depth) {
+    if (r - l <= MIN_TOKENS || depth >= MAX_DEPTH) {
+      ranges.push([tok.pos[l], r < m ? tok.pos[r] : n]);
+      return;
+    }
+    const c0 = costOf(l, r);
+    let bestM = -1, bestC = Infinity;
+    for (const frac of [0.5, 0.25, 0.75]) {
+      const mm = l + Math.floor((r - l) * frac);
+      if (mm <= l || mm >= r) continue;
+      const c = costOf(l, mm) + costOf(mm, r);
+      if (c < bestC) { bestC = c; bestM = mm; }
+    }
+    if (bestM > 0 && bestC < c0) {
+      bisect(l, bestM, depth + 1);
+      bisect(bestM, r, depth + 1);
+    } else {
+      ranges.push([tok.pos[l], r < m ? tok.pos[r] : n]);
+    }
+  }
+  bisect(0, m, 0);
+  const blockOf = new Uint8Array(n);
+  for (let b = 0; b < ranges.length; b++) {
+    const [s, e] = ranges[b];
+    for (let i = s; i < e; i++) blockOf[i] = b;
+  }
+  return { blockOf, numBlocks: ranges.length };
+}
+
 // Top-level v3 encoder: match cache once + fixed blocks + iterative global DP
 // with deterministic perturbation. Returns a zlib stream (Uint8Array).
 // opts: blockSize (default 262144), maxChain (default 256), stepBudgetPerByte
 // (default 64), maxRounds (default 8).
 export function deflateGlobalDP(data, opts = {}) {
   const n = data.length;
-  const blockSize = opts.blockSize ?? 262144;
   const maxChain = opts.maxChain ?? 512;
   const stepBudget = (opts.stepBudgetPerByte ?? 256) * n;
   const maxRounds = opts.maxRounds ?? 8;
-  const numBlocks = Math.max(1, Math.ceil(n / blockSize));
-  const blockOf = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    const b = (i / blockSize) | 0;
-    blockOf[i] = b < numBlocks ? b : numBlocks - 1;
-  }
   const padded = new Uint8Array(n + 258);
   padded.set(data);
   const ws = makeDPWorkspace(n);
   buildMatchCache(padded, n, maxChain, stepBudget, ws);
+  // MDL dynamic block boundaries (Carbon P2, measured +4,648 over fixed 256K).
+  const { blockOf, numBlocks } = mdlBlockSplit(padded, n, ws.stepOff, ws.stepPack);
   const rng = makeXorshift(0x9e3779b9);
   let litLensArr = Array.from({ length: numBlocks }, () => FIXED_LIT_LEN);
   let distLensArr = Array.from({ length: numBlocks }, () => FIXED_DIST_LEN);

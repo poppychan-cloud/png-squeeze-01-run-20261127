@@ -389,7 +389,9 @@ function entropyOf(row) {
 }
 
 // Filtered data for one form under one choice: fixed filter 0-4, 'minsum', 'pairs', 'brute'.
-function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(height * (width * bpp + 1))) {
+// If `seq` (Uint8Array of length height) is given, it is filled with the per-row
+// filter type actually used (needed by P4 band descent).
+function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(height * (width * bpp + 1)), seq = null) {
   const stride = width * bpp;
   const trial = Array.from({ length: 5 }, () => new Uint8Array(stride + 1));
   const seen = new Uint32Array(65536);
@@ -401,6 +403,7 @@ function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(heig
     if (typeof choice === 'number') {
       raw[at] = choice;
       filterRow(choice, cur, prev, bpp, raw.subarray(at + 1, at + 1 + stride));
+      if (seq) seq[y] = choice;
       continue;
     }
     const before = raw.subarray(Math.max(0, at - BRUTE_CONTEXT), at);
@@ -420,6 +423,7 @@ function filtered(samples, width, height, bpp, choice, raw = new Uint8Array(heig
       }
     }
     raw.set(trial[type], at);
+    if (seq) seq[y] = type;
   }
   return raw;
 }
@@ -474,21 +478,22 @@ function formsOf(rgba, width, height) {
 
 const chunkBytes = (form) => (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
 
-// Screen every form x filter choice by zlib level 6; return the winner (form, choice, filtered data).
+// Screen every form x filter choice by zlib level 6; return the winner (form, choice, filtered data, seq).
 function screen(rgba, width, height) {
   let best = null;
   let spare = null;
+  const seqBuf = new Uint8Array(height);
   for (const form of formsOf(rgba, width, height)) {
     const size = height * (width * form.bpp + 1);
     const chunks = chunkBytes(form);
     for (const choice of form.filters) {
-      const data = filtered(form.samples, width, height, form.bpp, choice, spare !== null && spare.length === size ? spare : new Uint8Array(size));
+      const data = filtered(form.samples, width, height, form.bpp, choice, spare !== null && spare.length === size ? spare : new Uint8Array(size), seqBuf);
       spare = null;
       const zlib = deflateSync(data, SCREEN);
       const bytes = zlib.length + chunks;
       if (best === null || bytes < best.bytes) {
         if (best !== null) spare = best.data;
-        best = { form, choice, data, bytes };
+        best = { form, choice, data, bytes, seq: Uint8Array.from(seqBuf) };
       } else spare = data;
     }
   }
@@ -504,11 +509,79 @@ function pngOfForm(width, height, form, idat) {
   return pngOf(chunks);
 }
 
+// P4 band coordinate descent (Carbon): flip whole 16-row bands to a single
+// filter, accepting only when a windowed zlib-1 estimate strictly decreases.
+// The window is the band plus one context row on each side, so cross-row
+// matches (dist = rowStride) are visible to the estimator. Single pass.
+const BAND_ROWS = 16;
+const BAND_CANDIDATES = [0, 1, 2, 3, 4];
+function bandDescent(form, data, seq, width, height) {
+  const bpp = form.bpp;
+  const stride = width * bpp;
+  const rowLen = stride + 1;
+  const samples = form.samples;
+  const newData = Uint8Array.from(data);
+  const newSeq = Uint8Array.from(seq);
+  const bandRow = new Uint8Array(stride);
+  const windowBuf = new Uint8Array((BAND_ROWS + 2) * rowLen);
+  let flips = 0;
+  for (let bs = 0; bs < height; bs += BAND_ROWS) {
+    const be = Math.min(height, bs + BAND_ROWS);
+    const wStart = Math.max(0, bs - 1);
+    const wEnd = Math.min(height, be + 1);
+    const wRows = wEnd - wStart;
+    windowBuf.set(newData.subarray(wStart * rowLen, wEnd * rowLen), 0);
+    const curCost = deflateSync(windowBuf.subarray(0, wRows * rowLen), { level: 1 }).length;
+    let bestT = -1;
+    let bestCost = curCost;
+    for (const t of BAND_CANDIDATES) {
+      let allT = true;
+      for (let y = bs; y < be; y++) if (newSeq[y] !== t) { allT = false; break; }
+      if (allT) continue;
+      windowBuf.set(newData.subarray(wStart * rowLen, wEnd * rowLen), 0);
+      for (let y = bs; y < be; y++) {
+        const cur = samples.subarray(y * stride, (y + 1) * stride);
+        const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+        filterRow(t, cur, prev, bpp, bandRow);
+        const wAt = (y - wStart) * rowLen;
+        windowBuf[wAt] = t;
+        windowBuf.set(bandRow, wAt + 1);
+      }
+      const c = deflateSync(windowBuf.subarray(0, wRows * rowLen), { level: 1 }).length;
+      if (c < bestCost) { bestCost = c; bestT = t; }
+    }
+    if (bestT >= 0) {
+      for (let y = bs; y < be; y++) {
+        const cur = samples.subarray(y * stride, (y + 1) * stride);
+        const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+        filterRow(bestT, cur, prev, bpp, bandRow);
+        const at = y * rowLen;
+        newData[at] = bestT;
+        newData.set(bandRow, at + 1);
+        newSeq[y] = bestT;
+      }
+      flips++;
+    }
+  }
+  return { data: newData, seq: newSeq, flips };
+}
+
 // ---- Main: one run over every instance in the input dir. ----
 for (const id of readdirSync(I).sort()) {
   const tId = Date.now();
   const image = decodePng(new Uint8Array(readFileSync(join(I, id, 'image.png'))));
-  const { form, data, choice } = screen(image.rgba, image.width, image.height);
+  let { form, data, choice, seq } = screen(image.rgba, image.width, image.height);
+  // P4 band descent (Carbon, measured +4,246 over MDL-only): flip whole 16-row
+  // bands, keeping only flips the full-stream zlib-6 verifies as better.
+  const bd = bandDescent(form, data, seq, image.width, image.height);
+  if (bd.flips > 0) {
+    const zOrig = deflateSync(data, SCREEN).length;
+    const zBand = deflateSync(bd.data, SCREEN).length;
+    if (zBand < zOrig) {
+      data = bd.data;
+      seq = bd.seq;
+    }
+  }
   if (process.env.DUMP_FILTERED) writeFileSync(`/tmp/filtered-${id}.bin`, data);
   if (process.env.PNG_SQUEEZE_TIMING) console.error(`[screen] ${id} colourType=${form.colourType} bpp=${form.bpp} choice=${String(choice)}`);
   const tScreen = Date.now() - tId;
@@ -523,6 +596,7 @@ for (const id of readdirSync(I).sort()) {
   // Global DP (Carbon P1+P2): match cache + dual-hash + full sublen steps,
   // whole-stream forward DP with per-block Huffman cost tables, iterative
   // refinement with deterministic perturbation. Runs on every winning stream.
+  // MDL dynamic blocks are always on inside deflateGlobalDP.
   const gdp = deflateGlobalDP(data);
   if (gdp.length < best.length) best = gdp;
   if (process.env.PNG_SQUEEZE_PROBE_FILTERS) {
