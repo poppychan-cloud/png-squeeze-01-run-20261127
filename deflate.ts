@@ -714,9 +714,11 @@ function makeDPWorkspace(maxN) {
   return {
     same: new Uint16Array(maxN),
     head1: new Int32Array(1 << 15).fill(-1),
-    prev1: new Int32Array(maxN),
+    // All prev accesses use 15-bit ring indices (slot = i & 32767), so the
+    // chains only need 32 KiB of entries, not the whole stream.
+    prev1: new Int32Array(Math.min(maxN, 32768)),
     head2: new Int32Array(1 << 15).fill(-1),
-    prev2: new Int32Array(maxN),
+    prev2: new Int32Array(Math.min(maxN, 32768)),
     stepOff: new Uint32Array(maxN + 1),
     stepPack: new Uint32Array(Math.max(1024, maxN * 2)),
     cost: new Uint32Array(maxN + 1),
@@ -798,7 +800,11 @@ function buildMatchCache(data, n, maxChain, stepBudget, ws) {
           if (bestLen === maxL) break;
         }
       }
-      if (!usingHash2 && bestLen >= sLen && sLen < 258 && i + sLen < n) {
+      // When sLen == 1 the hash2 key only distinguishes the first two bytes
+      // and the run length, and bestLen(2) >= sLen is already true — so the
+      // first chain would be abandoned after a single probe, missing long
+      // matches that only the hash1 chain reaches. Keep the first chain.
+      if (!usingHash2 && sLen > 1 && bestLen >= sLen && sLen < 258 && i + sLen < n) {
         // Switch to the hash2 chain: continue from the head of THIS position's
         // hash2 chain (prev2[i]), not from prev2[p] — p's run structure is
         // only guaranteed to match i's when p itself produced the long match,
@@ -900,6 +906,72 @@ function buildCostTables(numBlocks, litLensArr, distLensArr) {
   return { litCost, lenCost, distCost };
 }
 
+// Exact bit counts for one DEFLATE block, mirroring emitDynamicBlock /
+// emitFixedBlock bit-for-bit (same header construction, same token costs,
+// including the greedy-vs-DP RLE choice in the dynamic header). Lets
+// emitGlobal pick dynamic vs fixed without trial-writing both blocks.
+// The comparison uses ceil(bits/8) with dynamic winning ties, exactly as
+// the old trial-write compared dynBytes.length <= fixBytes.length.
+function dynamicBlockBits(tokens, dyn) {
+  const { litLens, distLens, maxLit, maxDist } = dyn;
+  const seq = new Uint8Array(maxLit + 1 + maxDist + 1);
+  seq.set(litLens.subarray(0, maxLit + 1), 0);
+  seq.set(distLens.subarray(0, maxDist + 1), maxLit + 1);
+  let { syms, extras } = rleCodeLens(seq);
+  {
+    const clFreq0 = new Float64Array(19);
+    for (const s of syms) clFreq0[s]++;
+    const clLens0 = huffmanLengths(clFreq0, 7);
+    const dp = rleCodeLensDP(seq, clLens0);
+    const clFreq1 = new Float64Array(19);
+    for (const s of dp.syms) clFreq1[s]++;
+    const clLens1 = huffmanLengths(clFreq1, 7);
+    if (rleSymbolBits(dp.syms, dp.extras, clLens1) < rleSymbolBits(syms, extras, clLens0)) {
+      syms = dp.syms;
+      extras = dp.extras;
+    }
+  }
+  const clFreq = new Float64Array(19);
+  for (const s of syms) clFreq[s]++;
+  const clLens = huffmanLengths(clFreq, 7);
+  let hclen = 4;
+  for (let j = 18; j >= 4; j--) if (clLens[CL_ORDER[j]] > 0) { hclen = j + 1; break; }
+  let bits = 3 + 5 + 5 + 4 + hclen * 3; // BFINAL+BTYPE, HLIT, HDIST, HCLEN, CL lengths
+  for (let k = 0; k < syms.length; k++) {
+    const s = syms[k];
+    bits += clLens[s];
+    if (s === 16) bits += 2;
+    else if (s === 17) bits += 3;
+    else if (s === 18) bits += 7;
+  }
+  for (const t of tokens) {
+    if (typeof t === 'number') {
+      bits += litLens[t];
+    } else {
+      const lc = lenCodeOf(t.len);
+      const dc = distCodeOf(t.dist);
+      bits += litLens[257 + lc] + LEN_EXTRA[lc] + distLens[dc] + DIST_EXTRA[dc];
+    }
+  }
+  bits += litLens[256]; // end of block
+  return bits;
+}
+
+function fixedBlockBits(tokens) {
+  let bits = 3; // BFINAL+BTYPE
+  for (const t of tokens) {
+    if (typeof t === 'number') {
+      bits += FIXED_LIT_LEN[t];
+    } else {
+      const lc = lenCodeOf(t.len);
+      const dc = distCodeOf(t.dist);
+      bits += FIXED_LIT_LEN[257 + lc] + LEN_EXTRA[lc] + FIXED_DIST_LEN[dc] + DIST_EXTRA[dc];
+    }
+  }
+  bits += FIXED_LIT_LEN[256]; // end of block
+  return bits;
+}
+
 // Emit the DP token list as a zlib stream, one DEFLATE block per block index
 // (tokens grouped by the block of their start position; dynamic vs fixed per
 // block, smaller wins). Returns {bytes, litFreqArr, distFreqArr}.
@@ -925,13 +997,11 @@ function emitGlobal(data, tokens, blockOf, numBlocks) {
   for (let b = 0; b < numBlocks; b++) {
     const isFinal = b === numBlocks - 1;
     const dyn = buildDynamic(litFreqArr[b], distFreqArr[b]);
-    const bwD = new BitWriter();
-    emitDynamicBlock(bwD, blockTokens[b], dyn, isFinal);
-    const dynBytes = bwD.finish();
-    const bwF = new BitWriter();
-    emitFixedBlock(bwF, blockTokens[b], isFinal);
-    const fixBytes = bwF.finish();
-    if (dynBytes.length <= fixBytes.length) emitDynamicBlock(bw, blockTokens[b], dyn, isFinal);
+    // Pick dynamic vs fixed by exact bit counts (same ceil/8 rounding and
+    // dynamic-wins-ties rule as the old trial-write), then emit only the winner.
+    const dynBits = dynamicBlockBits(blockTokens[b], dyn);
+    const fixBits = fixedBlockBits(blockTokens[b]);
+    if (((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3)) emitDynamicBlock(bw, blockTokens[b], dyn, isFinal);
     else emitFixedBlock(bw, blockTokens[b], isFinal);
   }
   const best = bw.finish();

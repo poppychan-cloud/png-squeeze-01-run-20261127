@@ -568,14 +568,15 @@ function bandDescent(form, data, seq, width, height) {
 
 // ---- Main: one run over every instance in the input dir. ----
 for (const id of readdirSync(I).sort()) {
-  const tId = Date.now();
   const image = decodePng(new Uint8Array(readFileSync(join(I, id, 'image.png'))));
-  let { form, data, choice, seq } = screen(image.rgba, image.width, image.height);
+  let { form, data, choice, seq, bytes } = screen(image.rgba, image.width, image.height);
   // P4 band descent (Carbon, measured +4,246 over MDL-only): flip whole 16-row
   // bands, keeping only flips the full-stream zlib-6 verifies as better.
   const bd = bandDescent(form, data, seq, image.width, image.height);
   if (bd.flips > 0) {
-    const zOrig = deflateSync(data, SCREEN).length;
+    // screen() already compressed this exact stream at zlib-6: bytes is
+    // zlib6.length + chunkBytes(form), so reuse it instead of re-running.
+    const zOrig = bytes - chunkBytes(form);
     const zBand = deflateSync(bd.data, SCREEN).length;
     if (zBand < zOrig) {
       data = bd.data;
@@ -584,7 +585,6 @@ for (const id of readdirSync(I).sort()) {
   }
   if (process.env.DUMP_FILTERED) writeFileSync(`/tmp/filtered-${id}.bin`, data);
   if (process.env.PNG_SQUEEZE_TIMING) console.error(`[screen] ${id} colourType=${form.colourType} bpp=${form.bpp} choice=${String(choice)}`);
-  const tScreen = Date.now() - tId;
   // zlib level-9 fallback (Carbon: Z_HUFFMAN_ONLY and Z_FIXED always lose on
   // filtered screenshots, so only DEFAULT / FILTERED / RLE at memLevel 9).
   let best = null;
@@ -610,9 +610,6 @@ for (const id of readdirSync(I).sort()) {
       const z9 = deflateSync(d, FINAL).length;
       console.error(`[probe] ${id} ct=${form.colourType} choice=${String(ch)} zlib6=${z6} zlib9=${z9} globalDP=${opt}`);
     }
-  }
-  if (process.env.PNG_SQUEEZE_TIMING) {
-    console.error(`[timing] ${id} screen ${tScreen}ms total ${Date.now() - tId}ms best=${best.length}`);
   }
   mkdirSync(join(O, id), { recursive: true });
   writeFileSync(join(O, id, 'image.png'), pngOfForm(image.width, image.height, form, best));
