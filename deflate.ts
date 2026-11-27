@@ -1,0 +1,704 @@
+// deflate.ts — a zopfli-style optimal-parsing DEFLATE encoder (zlib stream out).
+// Written from scratch for png-squeeze-01: hash-chain LZ77 with lazy matching and
+// bit-cost-aware match acceptance, iterated against optimal Huffman code lengths,
+// emitted as dynamic-Huffman blocks. Deterministic: no clock, no randomness.
+// Only used when it beats Node's zlib level 9 (measured per instance).
+
+// ---- Bit writer (DEFLATE packs bits LSB-first into bytes) ----
+export class BitWriter {
+  constructor() {
+    this.bytes = [];
+    this.acc = 0;
+    this.nbits = 0;
+  }
+  writeBits(value, count) {
+    // value's low `count` bits, least-significant bit first.
+    this.acc |= (value & ((count === 32 ? 0xffffffff : (1 << count) - 1))) << this.nbits;
+    this.nbits += count;
+    while (this.nbits >= 8) {
+      this.bytes.push(this.acc & 0xff);
+      this.acc >>>= 8;
+      this.nbits -= 8;
+    }
+  }
+  writeCode(code, len) {
+    // A Huffman code: emit its bits most-significant first.
+    for (let i = len - 1; i >= 0; i--) this.writeBits((code >> i) & 1, 1);
+  }
+  finish() {
+    if (this.nbits > 0) this.bytes.push(this.acc & 0xff);
+    return new Uint8Array(this.bytes);
+  }
+}
+
+// ---- DEFLATE length / distance code tables ----
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+
+function lenCodeOf(len) {
+  let lo = 0, hi = 28;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (LEN_BASE[mid] <= len) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+function distCodeOf(dist) {
+  let lo = 0, hi = 29;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (DIST_BASE[mid] <= dist) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+// ---- Huffman: code lengths from frequencies (priority queue), canonical codes ----
+// Fixed-Huffman literal lengths (RFC 1951) as the first-iteration cost model.
+const FIXED_LIT_LEN = new Uint8Array(288);
+for (let i = 0; i < 144; i++) FIXED_LIT_LEN[i] = 8;
+for (let i = 144; i < 256; i++) FIXED_LIT_LEN[i] = 9;
+for (let i = 256; i < 280; i++) FIXED_LIT_LEN[i] = 7;
+for (let i = 280; i < 288; i++) FIXED_LIT_LEN[i] = 8;
+const FIXED_DIST_LEN = new Uint8Array(30).fill(5);
+
+// Clamp code lengths to `maxLen` and repair the Kraft sum to EXACTLY 1 (a
+// complete prefix code). The old version lengthened the rarest symbol until
+// Kraft <= 1, which can overshoot below 1: an incomplete code-length code is
+// rejected by inflate ("invalid code lengths set") even when its longest
+// length is 1. So this version works in exact integer units of 2^-maxLen and
+// only ever takes steps that fit the remaining gap, then verifies Kraft == 1
+// and falls back to a balanced complete code if anything is still off.
+// Always terminates: every step moves Kraft by >= 1 unit toward the target.
+function limitLengths(freqs, lengths, maxLen) {
+  const n = lengths.length;
+  const out = Uint8Array.from(lengths);
+  let max = 0;
+  for (let i = 0; i < n; i++) if (out[i] > max) max = out[i];
+  if (max <= maxLen) return out;
+  for (let i = 0; i < n; i++) if (out[i] > maxLen) out[i] = maxLen;
+  const TARGET = 1 << maxLen;
+  const kraftUnits = () => {
+    let K = 0;
+    for (let i = 0; i < n; i++) if (out[i] > 0) K += 1 << (maxLen - out[i]);
+    return K;
+  };
+  const used = [...Array(n).keys()].filter((i) => freqs[i] > 0);
+  const rareFirst = [...used].sort((a, b) => freqs[a] - freqs[b] || a - b);
+  const freqFirst = [...used].sort((a, b) => freqs[b] - freqs[a] || a - b);
+  let guard = 0;
+  // Oversubscribed: lengthen by exact steps that never overshoot below TARGET.
+  while (kraftUnits() > TARGET && guard++ < 100000) {
+    const need = kraftUnits() - TARGET;
+    let done = false;
+    for (const s of rareFirst) {
+      if (out[s] > 0 && out[s] < maxLen) {
+        const step = 1 << (maxLen - out[s] - 1);
+        if (step <= need) { out[s]++; done = true; break; }
+      }
+    }
+    if (!done) break;
+  }
+  // Incomplete: shorten by exact steps that never overshoot above TARGET.
+  guard = 0;
+  while (kraftUnits() < TARGET && guard++ < 100000) {
+    const need = TARGET - kraftUnits();
+    let done = false;
+    for (const s of freqFirst) {
+      if (out[s] > 1) {
+        const step = 1 << (maxLen - out[s]);
+        if (step <= need) { out[s]--; done = true; break; }
+      }
+    }
+    if (!done) break;
+  }
+  if (kraftUnits() !== TARGET) {
+    // Safety net: a balanced complete code over the used symbols (Kraft == 1
+    // by construction). Shorter lengths go to the most frequent symbols.
+    // (limitLengths is only reached with >= 2 used symbols; the 1-symbol
+    // case returns early in huffmanLengths.)
+    const m = used.length;
+    const L = Math.ceil(Math.log2(m));
+    const nShort = (1 << L) - m; // symbols at length L-1; the rest at L
+    out.fill(0);
+    for (let j = 0; j < m; j++) out[freqFirst[j]] = j < nShort ? L - 1 : L;
+  }
+  return out;
+}
+
+function huffmanLengths(freqs, maxLen) {
+  // freqs: array of counts (0 = unused). Returns Uint8Array of code lengths,
+  // every length <= maxLen, Kraft sum <= 1.
+  const n = freqs.length;
+  const lengths = new Uint8Array(n);
+  const used = [];
+  for (let i = 0; i < n; i++) if (freqs[i] > 0) used.push(i);
+  if (used.length === 0) return lengths;
+  if (used.length === 1) { lengths[used[0]] = 1; return lengths; }
+  // Min-heap of tree nodes.
+  const heap = [];
+  const push = (node) => {
+    heap.push(node);
+    let i = heap.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (heap[p].freq <= heap[i].freq) break;
+      [heap[p], heap[i]] = [heap[i], heap[p]];
+      i = p;
+    }
+  };
+  const pop = () => {
+    const top = heap[0];
+    const last = heap.pop();
+    if (heap.length > 0) {
+      heap[0] = last;
+      let i = 0;
+      for (;;) {
+        const l = i * 2 + 1, r = l + 1;
+        let m = i;
+        if (l < heap.length && heap[l].freq < heap[m].freq) m = l;
+        if (r < heap.length && heap[r].freq < heap[m].freq) m = r;
+        if (m === i) break;
+        [heap[m], heap[i]] = [heap[i], heap[m]];
+        i = m;
+      }
+    }
+    return top;
+  };
+  for (const s of used) push({ freq: freqs[s], leaf: s, left: null, right: null });
+  while (heap.length > 1) {
+    const a = pop(), b = pop();
+    push({ freq: a.freq + b.freq, leaf: -1, left: a, right: b });
+  }
+  const root = pop();
+  const walk = (node, depth) => {
+    if (node.leaf >= 0) { lengths[node.leaf] = depth; return; }
+    walk(node.left, depth + 1);
+    walk(node.right, depth + 1);
+  };
+  walk(root, 0);
+  return limitLengths(freqs, lengths, maxLen);
+}
+
+function canonicalCodes(lengths) {
+  // lengths: Uint8Array. Returns {codes: Uint32Array, lens: Uint8Array}.
+  const n = lengths.length;
+  const maxLen = Math.max(0, ...lengths);
+  const blCount = new Array(maxLen + 1).fill(0);
+  for (let i = 0; i < n; i++) if (lengths[i] > 0) blCount[lengths[i]]++;
+  const codes = new Uint32Array(n);
+  let code = 0;
+  const nextCode = new Array(maxLen + 1).fill(0);
+  for (let b = 1; b <= maxLen; b++) {
+    code = (code + blCount[b - 1]) << 1;
+    nextCode[b] = code;
+  }
+  for (let i = 0; i < n; i++) {
+    const len = lengths[i];
+    if (len > 0) codes[i] = nextCode[len]++;
+  }
+  return { codes, lens: lengths };
+}
+
+// ---- LZ77 matching (hash chains, most-recent first) ----
+const HASH_BITS = 15;
+const HASH_SIZE = 1 << HASH_BITS;
+const HASH_MASK = HASH_SIZE - 1;
+const WINDOW = 32768;
+const MAX_MATCH = 258;
+
+function hash3(data, i) {
+  return ((data[i] << 10) ^ (data[i + 1] << 5) ^ data[i + 2]) & HASH_MASK;
+}
+
+function longestMatch(data, pos, end, head, prev, maxChain, niceLen) {
+  const maxPossible = Math.min(MAX_MATCH, end - pos);
+  if (maxPossible < 3) return { len: 0, dist: 0 };
+  const h = hash3(data, pos);
+  let bestLen = 0;
+  let bestDist = 0;
+  let cand = head[h];
+  let chain = 0;
+  while (cand >= 0 && pos - cand <= WINDOW && chain < maxChain) {
+    // Quick filter: to beat the current best, the byte at bestLen must match.
+    if (bestLen === 0 || data[cand + bestLen] === data[pos + bestLen]) {
+      let len = 0;
+      while (len < maxPossible && data[cand + len] === data[pos + len]) len++;
+      if (len > bestLen) {
+        bestLen = len;
+        bestDist = pos - cand;
+        if (len >= niceLen || len >= maxPossible) break;
+      }
+    }
+    cand = prev[cand];
+    chain++;
+  }
+  return { len: bestLen, dist: bestDist };
+}
+
+// Tokenise `data[start..end)` into literals (numbers 0-255) and matches
+// ({len, dist}) using lazy matching and a bit-cost model (litLen/lenLen/distLen
+// are Huffman code lengths). `head`/`prev` are scratch hash-chain arrays shared
+// by the caller (head is reset here; prev is indexed by absolute position and
+// only entries in [lo, end) are written). Positions before `start` (up to one
+// window back) are inserted as match sources, so matches may reach into
+// earlier data, but no emitted match ever crosses `end`.
+// Returns {tokens, litFreq, distFreq}.
+export function tokenizeRange(data, start, end, litLen, lenLen, distLen, maxChain, niceLen, head, prev) {
+  head.fill(-1);
+  const tokens = [];
+  const litFreq = new Float64Array(288);
+  const distFreq = new Float64Array(30);
+  let inserted = Math.max(0, start - WINDOW);
+  const insertUpTo = (p) => {
+    const lim = Math.min(p, end - 2);
+    while (inserted < lim) {
+      const h = hash3(data, inserted);
+      prev[inserted] = head[h];
+      head[h] = inserted;
+      inserted++;
+    }
+  };
+  const matchCost = (len, dist) => {
+    const lc = lenCodeOf(len);
+    const dc = distCodeOf(dist);
+    return lenLen[lc] + LEN_EXTRA[lc] + distLen[dc] + DIST_EXTRA[dc];
+  };
+  let i = start;
+  while (i < end) {
+    insertUpTo(i);
+    const m1 = longestMatch(data, i, end, head, prev, maxChain, niceLen);
+    if (m1.len < 3) {
+      tokens.push(data[i]);
+      litFreq[data[i]]++;
+      i++;
+      continue;
+    }
+    if (m1.len < 16) {
+      // Lazy: a match one byte on may be longer.
+      insertUpTo(i + 1);
+      const m2 = longestMatch(data, i + 1, end, head, prev, maxChain, niceLen);
+      if (m2.len > m1.len) {
+        tokens.push(data[i]);
+        litFreq[data[i]]++;
+        i++;
+        continue;
+      }
+    }
+    // Take the match only if it beats its literals in bits.
+    let litCostSum = 0;
+    for (let k = 0; k < m1.len; k++) litCostSum += litLen[data[i + k]];
+    if (matchCost(m1.len, m1.dist) >= litCostSum) {
+      tokens.push(data[i]);
+      litFreq[data[i]]++;
+      i++;
+      continue;
+    }
+    tokens.push({ len: m1.len, dist: m1.dist });
+    litFreq[257 + lenCodeOf(m1.len)]++;
+    distFreq[distCodeOf(m1.dist)]++;
+    i += m1.len;
+  }
+  litFreq[256]++; // end of block
+  return { tokens, litFreq, distFreq };
+}
+
+// DP optimal parse of `data[start..end)` (replaces the greedy+lazy tokeniser).
+// Forward shortest path: cost[i] = cheapest bit cost to reach offset i, using
+// the current Huffman lengths as the cost model. At each offset the literal is
+// always available; the match (longest found by the hash chain) is offered at
+// every length that is a length-code minimum (LEN_BASE) or the longest length
+// itself — those are the only lengths that can be optimal for a given distance
+// (a longer length in the same code costs more extra bits for the same code
+// length, so the DP only needs the code's minimum plus the longest length).
+// dpChain bounds the hash-chain walk per position (the DP calls the matcher
+// at EVERY offset, so a deep chain would be far too slow); the DP compensates
+// for the weaker match search by choosing lengths optimally. Same interface
+// and hash-chain sharing contract as tokenizeRange.
+export function tokenizeDP(data, start, end, litLen, lenLen, distLen, maxChain, niceLen, head, prev) {
+  head.fill(-1);
+  const n = end - start;
+  const cost = new Float64Array(n + 1).fill(Infinity);
+  const prevPos = new Int32Array(n + 1);
+  const prevLen = new Int16Array(n + 1);
+  const prevDist = new Int32Array(n + 1);
+  cost[0] = 0;
+  let inserted = Math.max(0, start - WINDOW);
+  const insertUpTo = (p) => {
+    const lim = Math.min(p, end - 2);
+    while (inserted < lim) {
+      const h = hash3(data, inserted);
+      prev[inserted] = head[h];
+      head[h] = inserted;
+      inserted++;
+    }
+  };
+  for (let i = 0; i < n; i++) {
+    if (cost[i] === Infinity) continue;
+    const pos = start + i;
+    insertUpTo(pos);
+    // Literal.
+    const litC = cost[i] + litLen[data[pos]];
+    if (litC < cost[i + 1]) {
+      cost[i + 1] = litC;
+      prevPos[i + 1] = i;
+      prevLen[i + 1] = 1;
+      prevDist[i + 1] = 0;
+    }
+    // Match.
+    const m = longestMatch(data, pos, end, head, prev, maxChain, niceLen);
+    if (m.len < 3) continue;
+    const dc = distCodeOf(m.dist);
+    const distC = distLen[dc] + DIST_EXTRA[dc];
+    // Candidate lengths: length-code minima up to m.len, plus m.len itself.
+    const cands = [];
+    for (let lc = 0; lc < 29; lc++) {
+      const len = LEN_BASE[lc];
+      if (len > m.len) break;
+      if (len >= 3) cands.push(len);
+    }
+    if (cands[cands.length - 1] !== m.len) cands.push(m.len);
+    for (const len of cands) {
+      const lc = lenCodeOf(len);
+      const c = cost[i] + lenLen[lc] + LEN_EXTRA[lc] + distC;
+      const j = i + len;
+      if (c < cost[j]) {
+        cost[j] = c;
+        prevPos[j] = i;
+        prevLen[j] = len;
+        prevDist[j] = m.dist;
+      }
+    }
+  }
+  // Reconstruct the token list by walking back from n.
+  const tokens = [];
+  const litFreq = new Float64Array(288);
+  const distFreq = new Float64Array(30);
+  let j = n;
+  const rev = [];
+  while (j > 0) {
+    const i = prevPos[j];
+    const len = prevLen[j];
+    if (len === 1) rev.push(data[start + i]);
+    else rev.push({ len, dist: prevDist[j] });
+    j = i;
+  }
+  rev.reverse();
+  for (const t of rev) {
+    tokens.push(t);
+    if (typeof t === 'number') litFreq[t]++;
+    else {
+      litFreq[257 + lenCodeOf(t.len)]++;
+      distFreq[distCodeOf(t.dist)]++;
+    }
+  }
+  litFreq[256]++; // end of block
+  return { tokens, litFreq, distFreq };
+}
+
+// Whole-data tokenise (the single-block path): fresh hash chains, [0, n).
+export function tokenize(data, litLen, lenLen, distLen, maxChain, niceLen) {
+  const head = new Int32Array(HASH_SIZE).fill(-1);
+  const prev = new Int32Array(data.length).fill(-1);
+  return tokenizeRange(data, 0, data.length, litLen, lenLen, distLen, maxChain, niceLen, head, prev);
+}
+
+// Build dynamic-Huffman code lengths from token frequencies. Returns
+// {litLens, distLens, litCodes, distCodes, maxLit, maxDist}.
+export function buildDynamic(litFreq, distFreq) {
+  const litLens = huffmanLengths(litFreq, 15);
+  let distLens = huffmanLengths(distFreq, 15);
+  // DEFLATE needs at least one distance code; a block with no matches still
+  // needs a (single, unused) distance code of length 1.
+  if (distFreq.every((f) => f === 0)) {
+    distLens = new Uint8Array(30);
+    distLens[0] = 1;
+  }
+  // Trim trailing zero lengths (HLIT/HDIST count only up to the last used code).
+  let maxLit = 286;
+  while (maxLit > 257 && litLens[maxLit] === 0) maxLit--;
+  let maxDist = 29;
+  while (maxDist > 0 && distLens[maxDist] === 0) maxDist--;
+  const litC = canonicalCodes(litLens);
+  const distC = canonicalCodes(distLens);
+  return {
+    litLens, distLens,
+    litCodes: litC.codes, distCodes: distC.codes,
+    maxLit, maxDist,
+  };
+}
+
+// ---- Dynamic-Huffman block emission ----
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+// Run-length-encode a code-length sequence into symbols 0-18 (with extra values).
+// Returns {syms: number[], extras: number[]} (parallel arrays).
+function rleCodeLens(lens) {
+  const syms = [];
+  const extras = [];
+  let i = 0;
+  const n = lens.length;
+  while (i < n) {
+    const v = lens[i];
+    let run = 1;
+    while (i + run < n && lens[i + run] === v) run++;
+    if (v === 0) {
+      let r = run;
+      while (r >= 11) {
+        const take = Math.min(r, 138);
+        syms.push(18); extras.push(take - 11);
+        r -= take;
+      }
+      if (r >= 3) {
+        syms.push(17); extras.push(r - 3);
+        r = 0;
+      }
+      while (r > 0) { syms.push(0); extras.push(0); r--; }
+    } else {
+      syms.push(v); extras.push(0);
+      let r = run - 1;
+      while (r >= 3) {
+        const take = Math.min(r, 6);
+        syms.push(16); extras.push(take - 3);
+        r -= take;
+      }
+      while (r > 0) { syms.push(v); extras.push(0); r--; }
+    }
+    i += run;
+  }
+  return { syms, extras };
+}
+
+export function emitDynamicBlock(bw, tokens, dyn, isFinal) {
+  bw.writeBits(isFinal ? 1 : 0, 1);
+  bw.writeBits(2, 2); // BTYPE dynamic
+  const { litLens, distLens, litCodes, distCodes, maxLit, maxDist } = dyn;
+  // The code-length sequence: literal/length lengths then distance lengths.
+  const seq = new Uint8Array(maxLit + 1 + maxDist + 1);
+  seq.set(litLens.subarray(0, maxLit + 1), 0);
+  seq.set(distLens.subarray(0, maxDist + 1), maxLit + 1);
+  const { syms, extras } = rleCodeLens(seq);
+  const clFreq = new Float64Array(19);
+  for (const s of syms) clFreq[s]++;
+  const clLens = huffmanLengths(clFreq, 7);
+  const clC = canonicalCodes(clLens);
+  let hclen = 4;
+  for (let j = 18; j >= 4; j--) if (clLens[CL_ORDER[j]] > 0) { hclen = j + 1; break; }
+  bw.writeBits(maxLit - 256, 5);
+  bw.writeBits(maxDist, 5);
+  bw.writeBits(hclen - 4, 4);
+  for (let j = 0; j < hclen; j++) bw.writeBits(clLens[CL_ORDER[j]], 3);
+  for (let k = 0; k < syms.length; k++) {
+    const s = syms[k];
+    bw.writeCode(clC.codes[s], clLens[s]);
+    if (s === 16) bw.writeBits(extras[k], 2);
+    else if (s === 17) bw.writeBits(extras[k], 3);
+    else if (s === 18) bw.writeBits(extras[k], 7);
+  }
+  for (const t of tokens) {
+    if (typeof t === 'number') {
+      bw.writeCode(litCodes[t], litLens[t]);
+    } else {
+      const lc = lenCodeOf(t.len);
+      const dc = distCodeOf(t.dist);
+      bw.writeCode(litCodes[257 + lc], litLens[257 + lc]);
+      if (LEN_EXTRA[lc] > 0) bw.writeBits(t.len - LEN_BASE[lc], LEN_EXTRA[lc]);
+      bw.writeCode(distCodes[dc], distLens[dc]);
+      if (DIST_EXTRA[dc] > 0) bw.writeBits(t.dist - DIST_BASE[dc], DIST_EXTRA[dc]);
+    }
+  }
+  bw.writeCode(litCodes[256], litLens[256]); // end of block
+}
+
+export function emitFixedBlock(bw, tokens, isFinal) {
+  bw.writeBits(isFinal ? 1 : 0, 1);
+  bw.writeBits(1, 2); // BTYPE fixed
+  const litC = canonicalCodes(FIXED_LIT_LEN);
+  const distC = canonicalCodes(FIXED_DIST_LEN);
+  for (const t of tokens) {
+    if (typeof t === 'number') {
+      bw.writeCode(litC.codes[t], FIXED_LIT_LEN[t]);
+    } else {
+      const lc = lenCodeOf(t.len);
+      const dc = distCodeOf(t.dist);
+      bw.writeCode(litC.codes[257 + lc], FIXED_LIT_LEN[257 + lc]);
+      if (LEN_EXTRA[lc] > 0) bw.writeBits(t.len - LEN_BASE[lc], LEN_EXTRA[lc]);
+      bw.writeCode(distC.codes[dc], FIXED_DIST_LEN[dc]);
+      if (DIST_EXTRA[dc] > 0) bw.writeBits(t.dist - DIST_BASE[dc], DIST_EXTRA[dc]);
+    }
+  }
+  bw.writeCode(litC.codes[256], FIXED_LIT_LEN[256]);
+}
+
+// Adler-32 (zlib's checksum).
+function adler32(bytes) {
+  let a = 1, b = 0;
+  for (let i = 0; i < bytes.length;) {
+    const end = Math.min(bytes.length, i + 5552);
+    for (; i < end; i++) { a += bytes[i]; b += a; }
+    a %= 65521; b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+// Encode `data` as a zlib stream with the optimal parser split into blocks of
+// `blockSize` bytes, each block carrying its own dynamic (or fixed) Huffman
+// table. Matches may reach into earlier blocks (the window spans blocks) but
+// never cross a block boundary. Per block, the cost model is iterated like
+// deflateOptimal (fixed costs, then that block's own dynamic lengths), and the
+// smaller of the block's dynamic / fixed encoding is kept.
+export function deflateOptimalBlocks(data, blockSize, maxChain = 64, niceLen = 32, rounds = 2) {
+  const head = new Int32Array(HASH_SIZE);
+  const prev = new Int32Array(data.length).fill(-1);
+  const bw = new BitWriter();
+  const nBlocks = Math.max(1, Math.ceil(data.length / blockSize));
+  for (let b = 0; b < nBlocks; b++) {
+    const start = b * blockSize;
+    const end = Math.min(data.length, start + blockSize);
+    const isFinal = b === nBlocks - 1;
+    // Cost model for this block: round 0 fixed, later rounds this block's own
+    // dynamic lengths from the previous round.
+    let litLen = FIXED_LIT_LEN;
+    let lenLen = new Uint8Array(29);
+    for (let c = 0; c < 29; c++) lenLen[c] = FIXED_LIT_LEN[257 + c];
+    let distLen = FIXED_DIST_LEN;
+    let bestTokens = null;
+    let bestDyn = null;
+    let bestBytes = Infinity;
+    for (let round = 0; round < rounds; round++) {
+      const { tokens, litFreq, distFreq } = tokenizeRange(data, start, end, litLen, lenLen, distLen, maxChain, niceLen, head, prev);
+      const dyn = buildDynamic(litFreq, distFreq);
+      const bwD = new BitWriter();
+      emitDynamicBlock(bwD, tokens, dyn, isFinal);
+      const dynBytes = bwD.finish();
+      const bwF = new BitWriter();
+      emitFixedBlock(bwF, tokens, isFinal);
+      const fixBytes = bwF.finish();
+      const roundBest = dynBytes.length <= fixBytes.length ? dynBytes.length : fixBytes.length;
+      if (roundBest < bestBytes) {
+        bestBytes = roundBest;
+        bestTokens = tokens;
+        bestDyn = dyn;
+      }
+      // Next round's cost model comes from this round's dynamic Huffman lengths.
+      litLen = dyn.litLens;
+      lenLen = new Uint8Array(29);
+      for (let c = 0; c < 29; c++) lenLen[c] = dyn.litLens[257 + c];
+      distLen = dyn.distLens;
+    }
+    // Emit the winning round's block into the main stream. Re-emit both forms
+    // and keep the smaller (identical sizes to the trials: same tokens, same
+    // isFinal flag).
+    const bwD = new BitWriter();
+    emitDynamicBlock(bwD, bestTokens, bestDyn, isFinal);
+    const dynBytes = bwD.finish();
+    const bwF = new BitWriter();
+    emitFixedBlock(bwF, bestTokens, isFinal);
+    const fixBytes = bwF.finish();
+    if (dynBytes.length <= fixBytes.length) emitDynamicBlock(bw, bestTokens, bestDyn, isFinal);
+    else emitFixedBlock(bw, bestTokens, isFinal);
+  }
+  const best = bw.finish();
+  // zlib wrapper: header 0x78 0x9C, deflate stream, adler32 (big-endian).
+  const out = new Uint8Array(2 + best.length + 4);
+  out[0] = 0x78; out[1] = 0x9c;
+  out.set(best, 2);
+  new DataView(out.buffer).setUint32(2 + best.length, adler32(data));
+  return out;
+}
+
+// Same as deflateOptimalBlocks but the per-block parse is the DP optimal parse
+// (tokenizeDP) instead of greedy+lazy. dpChain bounds the hash-chain walk per
+// DP position (the DP calls the matcher at every offset, so it must stay
+// shallow). Rounds iterate the Huffman cost model the same way.
+export function deflateOptimalBlocksDP(data, blockSize, dpChain = 16, niceLen = 258, rounds = 2) {
+  const head = new Int32Array(HASH_SIZE);
+  const prev = new Int32Array(data.length).fill(-1);
+  const bw = new BitWriter();
+  const nBlocks = Math.max(1, Math.ceil(data.length / blockSize));
+  for (let b = 0; b < nBlocks; b++) {
+    const start = b * blockSize;
+    const end = Math.min(data.length, start + blockSize);
+    const isFinal = b === nBlocks - 1;
+    let litLen = FIXED_LIT_LEN;
+    let lenLen = new Uint8Array(29);
+    for (let c = 0; c < 29; c++) lenLen[c] = FIXED_LIT_LEN[257 + c];
+    let distLen = FIXED_DIST_LEN;
+    let bestTokens = null;
+    let bestDyn = null;
+    let bestBytes = Infinity;
+    for (let round = 0; round < rounds; round++) {
+      const { tokens, litFreq, distFreq } = tokenizeDP(data, start, end, litLen, lenLen, distLen, dpChain, niceLen, head, prev);
+      const dyn = buildDynamic(litFreq, distFreq);
+      const bwD = new BitWriter();
+      emitDynamicBlock(bwD, tokens, dyn, isFinal);
+      const dynBytes = bwD.finish();
+      const bwF = new BitWriter();
+      emitFixedBlock(bwF, tokens, isFinal);
+      const fixBytes = bwF.finish();
+      const roundBest = dynBytes.length <= fixBytes.length ? dynBytes.length : fixBytes.length;
+      if (roundBest < bestBytes) {
+        bestBytes = roundBest;
+        bestTokens = tokens;
+        bestDyn = dyn;
+      }
+      litLen = dyn.litLens;
+      lenLen = new Uint8Array(29);
+      for (let c = 0; c < 29; c++) lenLen[c] = dyn.litLens[257 + c];
+      distLen = dyn.distLens;
+    }
+    const bwD = new BitWriter();
+    emitDynamicBlock(bwD, bestTokens, bestDyn, isFinal);
+    const dynBytes = bwD.finish();
+    const bwF = new BitWriter();
+    emitFixedBlock(bwF, bestTokens, isFinal);
+    const fixBytes = bwF.finish();
+    if (dynBytes.length <= fixBytes.length) emitDynamicBlock(bw, bestTokens, bestDyn, isFinal);
+    else emitFixedBlock(bw, bestTokens, isFinal);
+  }
+  const best = bw.finish();
+  const out = new Uint8Array(2 + best.length + 4);
+  out[0] = 0x78; out[1] = 0x9c;
+  out.set(best, 2);
+  new DataView(out.buffer).setUint32(2 + best.length, adler32(data));
+  return out;
+}
+
+// Encode `data` (filtered bytes) as a zlib stream with the optimal parser.
+// Iterates the cost model: fixed costs, then the dynamic Huffman costs from the
+// previous pass. Keeps the smallest of (dynamic, fixed) encodings.
+export function deflateOptimal(data, maxChain = 64, niceLen = 32, rounds = 2) {
+  let best = null;
+  // Cost model for this round: litLen[288], lenLen[29] (indexed by length code),
+  // distLen[30]. Round 0 uses the fixed Huffman lengths.
+  let litLen = FIXED_LIT_LEN;
+  let lenLen = new Uint8Array(29);
+  for (let c = 0; c < 29; c++) lenLen[c] = FIXED_LIT_LEN[257 + c];
+  let distLen = FIXED_DIST_LEN;
+  for (let round = 0; round < rounds; round++) {
+    const { tokens, litFreq, distFreq } = tokenize(data, litLen, lenLen, distLen, maxChain, niceLen);
+    const dyn = buildDynamic(litFreq, distFreq);
+    // Dynamic block.
+    const bwD = new BitWriter();
+    emitDynamicBlock(bwD, tokens, dyn, true);
+    const dynBytes = bwD.finish();
+    if (best === null || dynBytes.length < best.length) best = dynBytes;
+    // Fixed block (same tokens, fixed Huffman table).
+    const bwF = new BitWriter();
+    emitFixedBlock(bwF, tokens, true);
+    const fixBytes = bwF.finish();
+    if (fixBytes.length < best.length) best = fixBytes;
+    // Next round's cost model comes from this round's dynamic Huffman lengths.
+    litLen = dyn.litLens;
+    lenLen = new Uint8Array(29);
+    for (let c = 0; c < 29; c++) lenLen[c] = dyn.litLens[257 + c];
+    distLen = dyn.distLens;
+  }
+  // zlib wrapper: header 0x78 0x9C, deflate stream, adler32 (big-endian).
+  const out = new Uint8Array(2 + best.length + 4);
+  out[0] = 0x78; out[1] = 0x9c;
+  out.set(best, 2);
+  new DataView(out.buffer).setUint32(2 + best.length, adler32(data));
+  return out;
+}
