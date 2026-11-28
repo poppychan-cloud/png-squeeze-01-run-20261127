@@ -713,12 +713,20 @@ const DP_INF = 0xffffffff;
 function makeDPWorkspace(maxN) {
   return {
     same: new Uint16Array(maxN),
+    // V7 dual hash chains (head1/prev1 on the 3-byte prefix, head2/prev2 on
+    // the run structure). All prev accesses use 15-bit ring indices
+    // (slot = i & 32767), so the chains only need 32 KiB of entries.
     head1: new Int32Array(1 << 15).fill(-1),
-    // All prev accesses use 15-bit ring indices (slot = i & 32767), so the
-    // chains only need 32 KiB of entries, not the whole stream.
     prev1: new Int32Array(Math.min(maxN, 32768)),
     head2: new Int32Array(1 << 15).fill(-1),
     prev2: new Int32Array(Math.min(maxN, 32768)),
+    // BT4 (V8): head4 = BT4 root per 4-byte hash; left4/right4 = BT4 children
+    // indexed by ABSOLUTE position (not ring slots) so no aliasing when a
+    // slot is reused. All arrays are filled with -1 at the start of each
+    // buildMatchCache call.
+    head4: new Int32Array(1 << 16).fill(-1),
+    left4: new Int32Array(maxN).fill(-1),
+    right4: new Int32Array(maxN).fill(-1),
     stepOff: new Uint32Array(maxN + 1),
     stepPack: new Uint32Array(Math.max(1024, maxN * 2)),
     cost: new Uint32Array(maxN + 1),
@@ -727,16 +735,22 @@ function makeDPWorkspace(maxN) {
   };
 }
 
-// Build the LZ77 sublen-step cache (Carbon P1): for each position, the list of
-// (dist, startLen, endLen) steps, where each step says "a match of any length
-// in [startLen, endLen] is achievable at this dist, and startLen is one past
-// the previous best length for a shorter dist". Dual hash chains (prev1 on the
-// 3-byte prefix, prev2 on the run structure) skip the flood of 0,0,0 prefixes
-// with zero missed solutions. stepBudget is a deterministic cap on total
-// hash-chain steps (no clock). `data` must have >=258 bytes of zero padding
-// past n so getUint32/hash reads never run off the end.
-function buildMatchCache(data, n, maxChain, stepBudget, ws) {
-  const { same, head1, prev1, head2, prev2, stepOff } = ws;
+// Build the LZ77 sublen-step cache, hybrid (V8): dual hash chains (V7 exact)
+// FIRST for close matches, then BT4 to extend with longer matches.
+// For each position, the list of (dist, startLen, endLen) steps, where each step
+// says "a match of any length in [startLen, endLen] is achievable at this dist,
+// and startLen is one past the previous best length for a shorter dist".
+// Why hybrid: BT4 alone regressed -13,006 on practice. BT4 visits candidates in
+// lexicographic order, so a long FAR match can be recorded before a medium CLOSE
+// match is found, poisoning the staircase (the DP then pays the far distance
+// for short lengths). Chains visit most-recent-first, so they establish the
+// close short/medium staircase; BT4 only records len > bestLen (the chains'
+// best), extending it with genuinely longer matches. Pure BT3 is NOT used.
+// btDepth caps the BT4 walk per position (deterministic, no clock). `data` must
+// have >=258 bytes of zero padding past n so getUint32/hash reads never run off
+// the end. All recorded steps are verified real matches.
+function buildMatchCache(data, n, maxChain, stepBudget, btDepth, ws) {
+  const { same, head1, prev1, head2, prev2, head4, left4, right4, stepOff } = ws;
   let stepPack = ws.stepPack;
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   same[n - 1] = 1;
@@ -745,6 +759,9 @@ function buildMatchCache(data, n, maxChain, stepBudget, ws) {
   }
   head1.fill(-1);
   head2.fill(-1);
+  head4.fill(-1);
+  left4.fill(-1);
+  right4.fill(-1);
   let stepCount = 0;
   let usedChainOps = 0;
   const ensure = (need) => {
@@ -754,6 +771,21 @@ function buildMatchCache(data, n, maxChain, stepBudget, ws) {
       ws.stepPack = grown;
       stepPack = grown;
     }
+  };
+  // startL can be 258; clamp to 255 (lengths 255..258 are all valid for this
+  // dist once len=258 is reachable, so no solution is lost).
+  const recordStep = (dist, startL, endL) => {
+    ensure(1);
+    const sL = startL > 255 ? 255 : startL;
+    stepPack[stepCount++] = (dist << 16) | (sL << 8) | (endL - 3);
+  };
+  // Match length between data[a..] and data[b..], capped at maxL. Reads may run
+  // into the zero padding past n (safe: a+len and b+len stay < n+258).
+  const matchLen = (a, b, maxL) => {
+    let len = 0;
+    while (len + 4 <= maxL && dv.getUint32(a + len, true) === dv.getUint32(b + len, true)) len += 4;
+    while (len < maxL && data[a + len] === data[b + len]) len++;
+    return len;
   };
   for (let i = 0; i < n; i++) {
     stepOff[i] = stepCount;
@@ -769,53 +801,97 @@ function buildMatchCache(data, n, maxChain, stepBudget, ws) {
     const maxL = n - i < 258 ? n - i : 258;
     if (maxL < 3) continue;
     if (i > 0 && data[i] === data[i - 1] && sLen === 258 && maxL === 258) {
-      ensure(1);
-      stepPack[stepCount++] = (1 << 16) | (3 << 8) | (258 - 3);
+      recordStep(1, 3, 258);
       continue;
     }
+    const minPos = i > 32768 ? i - 32768 : 0;
+    let bestLen = 2;
+    // Phase 1: dual hash chains (V7 exact) — close matches first, establishes
+    // the staircase. sLen > 1 keeps the hash1 chain (Carbon's sLen >= 3
+    // measured -2 pts vs this, so V6/V7's rule is kept).
     const remPos = n - i;
     let dynLimit = ((stepBudget - usedChainOps) / remPos) | 0;
     if (dynLimit > maxChain) dynLimit = maxChain;
     else if (dynLimit < 8) dynLimit = 8;
     const limit = dynLimit;
-    let bestLen = 2;
     let p = prev1[slot];
     let usingHash2 = false;
-    const minPos = i > 32768 ? i - 32768 : 0;
     for (let steps = 0; p >= minPos && steps < limit; steps++) {
       usedChainOps++;
       if (data[p + bestLen] === data[i + bestLen]) {
-        let len = 0;
-        while (len + 4 <= maxL && dv.getUint32(p + len, true) === dv.getUint32(i + len, true)) len += 4;
-        while (len < maxL && data[p + len] === data[i + len]) len++;
+        const len = matchLen(p, i, maxL);
         if (len > bestLen) {
-          const dist = i - p;
-          const startL = bestLen + 1;
-          ensure(1);
-          // startL can be 258; clamp to 255 (lengths 255..258 are all valid
-          // for this dist once len=258 is reachable, so no solution is lost).
-          const sL = startL > 255 ? 255 : startL;
-          stepPack[stepCount++] = (dist << 16) | (sL << 8) | (len - 3);
+          recordStep(i - p, bestLen + 1, len);
           bestLen = len;
           if (bestLen === maxL) break;
         }
       }
-      // When sLen == 1 the hash2 key only distinguishes the first two bytes
-      // and the run length, and bestLen(2) >= sLen is already true — so the
-      // first chain would be abandoned after a single probe, missing long
-      // matches that only the hash1 chain reaches. Keep the first chain.
-      // Carbon's stricter sLen >= 3 measured -2 pts vs this (V6) on practice,
-      // so V6's sLen > 1 is kept.
       if (!usingHash2 && sLen > 1 && bestLen >= sLen && sLen < 258 && i + sLen < n) {
         // Switch to the hash2 chain: continue from the head of THIS position's
-        // hash2 chain (prev2[i]), not from prev2[p] — p's run structure is
-        // only guaranteed to match i's when p itself produced the long match,
-        // but bestLen may come from an earlier candidate.
+        // hash2 chain (prev2[i]), not from prev2[p].
         usingHash2 = true;
         p = prev2[slot];
       } else {
         p = usingHash2 ? prev2[p & 32767] : prev1[p & 32767];
       }
+    }
+    // Phase 2: BT4 (4-byte hash head + 32KB ring lexicographic BST, root
+    // insertion split). Only records len > bestLen, so it extends the
+    // chains' staircase with longer matches instead of poisoning it. The
+    // split/insert runs even when bestLen == maxL (tree must stay populated).
+    // Stale nodes (cur < minPos) are used for navigation but never recorded.
+    const h4 = ((dv.getUint32(i, true) * 0x9e3779b1) >>> 16) & 0xffff;
+    let node = head4[h4];
+    if (node === -1) {
+      head4[h4] = i;
+      left4[i] = -1;
+      right4[i] = -1;
+    } else {
+      let lRoot = -1, rRoot = -1;
+      let lTail = -1, rTail = -1;
+      let lastSide = 0; // 1 = last node went to L, 2 = last node went to R
+      let cur = node;
+      let steps = 0;
+      while (cur !== -1 && steps < btDepth) {
+        steps++;
+        const len = matchLen(cur, i, maxL);
+        if (cur >= minPos && len > bestLen) {
+          recordStep(i - cur, bestLen + 1, len);
+          bestLen = len;
+        }
+        // Side decision by first differing byte; if the strings match for the
+        // full maxL, treat as cur < i (deterministic).
+        let goL;
+        if (len >= maxL) goL = true;
+        else goL = data[cur + len] < data[i + len];
+        if (goL) {
+          const next = right4[cur];
+          if (lTail === -1) lRoot = cur; else right4[lTail] = cur;
+          lTail = cur;
+          right4[cur] = -1; // sever: cur's right subtree is the remainder
+          cur = next;
+          lastSide = 1;
+        } else {
+          const next = left4[cur];
+          if (rTail === -1) rRoot = cur; else left4[rTail] = cur;
+          rTail = cur;
+          left4[cur] = -1; // sever: cur's left subtree is the remainder
+          cur = next;
+          lastSide = 2;
+        }
+      }
+      if (cur !== -1) {
+        // Depth exhausted: reattach the remaining unexplored subtree to the
+        // tail of the last-visited side. It stays reachable; a few nodes may
+        // sit on the wrong side of i, which only costs matches, never validity.
+        if (lastSide === 1) right4[lTail] = cur;
+        else if (lastSide === 2) left4[rTail] = cur;
+        else if (lRoot === -1) lRoot = cur;
+        else right4[lTail] = cur;
+      }
+      left4[i] = lRoot;
+      right4[i] = rRoot;
+      head4[h4] = i;
     }
   }
   stepOff[n] = stepCount;
@@ -988,24 +1064,10 @@ function fixedBlockBits(tokens) {
   return bits;
 }
 
-// Bit count of the encoding emitGlobal would pick for one block (dynamic if
-// ceil(dyn/8) <= ceil(fix/8), else fixed). Mirrors emitGlobal's choice exactly.
-function chosenBlockBits(tokens, litFreq, distFreq) {
-  const dyn = buildDynamic(litFreq, distFreq);
-  const dynBits = dynamicBlockBits(tokens, dyn);
-  const fixBits = fixedBlockBits(tokens);
-  return ((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3) ? dynBits : fixBits;
-}
-
 // Emit the DP token list as a zlib stream, one DEFLATE block per block index
 // (tokens grouped by the block of their start position; dynamic vs fixed per
 // block, smaller wins). Returns {bytes, litFreqArr, distFreqArr}.
-// When doMerge is true, adjacent blocks are merged first (one left-to-right
-// pass): a pair merges only when the merged block's exact bit count (one EOB,
-// Huffman table re-derived from the combined freqs) is strictly less than the
-// sum of the two separate blocks' bit counts. Merged bit counts can only stay
-// the same or decrease the total byte length, never increase it.
-function emitGlobal(data, tokens, blockOf, numBlocks, doMerge = false) {
+function emitGlobal(data, tokens, blockOf, numBlocks) {
   const blockTokens = Array.from({ length: numBlocks }, () => []);
   const litFreqArr = Array.from({ length: numBlocks }, () => new Float64Array(288));
   const distFreqArr = Array.from({ length: numBlocks }, () => new Float64Array(30));
@@ -1023,43 +1085,23 @@ function emitGlobal(data, tokens, blockOf, numBlocks, doMerge = false) {
     }
   }
   for (let b = 0; b < numBlocks; b++) litFreqArr[b][256]++;
-  let blocks = [];
-  for (let b = 0; b < numBlocks; b++) blocks.push({ tokens: blockTokens[b], litFreq: litFreqArr[b], distFreq: distFreqArr[b] });
-  if (doMerge) {
-    const kept = [];
-    for (const blk of blocks) {
-      if (kept.length === 0) { kept.push(blk); continue; }
-      const last = kept[kept.length - 1];
-      const cTokens = last.tokens.concat(blk.tokens);
-      const cLit = new Float64Array(288);
-      for (let i = 0; i < 288; i++) cLit[i] = last.litFreq[i] + blk.litFreq[i];
-      cLit[256] = 1; // merged block carries a single EOB, not two
-      const cDist = new Float64Array(30);
-      for (let i = 0; i < 30; i++) cDist[i] = last.distFreq[i] + blk.distFreq[i];
-      const sepBits = chosenBlockBits(last.tokens, last.litFreq, last.distFreq) + chosenBlockBits(blk.tokens, blk.litFreq, blk.distFreq);
-      const mrgBits = chosenBlockBits(cTokens, cLit, cDist);
-      if (mrgBits < sepBits) kept[kept.length - 1] = { tokens: cTokens, litFreq: cLit, distFreq: cDist };
-      else kept.push(blk);
-    }
-    blocks = kept;
-  }
   const bw = new BitWriter();
-  for (let b = 0; b < blocks.length; b++) {
-    const isFinal = b === blocks.length - 1;
-    const dyn = buildDynamic(blocks[b].litFreq, blocks[b].distFreq);
+  for (let b = 0; b < numBlocks; b++) {
+    const isFinal = b === numBlocks - 1;
+    const dyn = buildDynamic(litFreqArr[b], distFreqArr[b]);
     // Pick dynamic vs fixed by exact bit counts (same ceil/8 rounding and
     // dynamic-wins-ties rule as the old trial-write), then emit only the winner.
-    const dynBits = dynamicBlockBits(blocks[b].tokens, dyn);
-    const fixBits = fixedBlockBits(blocks[b].tokens);
-    if (((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3)) emitDynamicBlock(bw, blocks[b].tokens, dyn, isFinal);
-    else emitFixedBlock(bw, blocks[b].tokens, isFinal);
+    const dynBits = dynamicBlockBits(blockTokens[b], dyn);
+    const fixBits = fixedBlockBits(blockTokens[b]);
+    if (((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3)) emitDynamicBlock(bw, blockTokens[b], dyn, isFinal);
+    else emitFixedBlock(bw, blockTokens[b], isFinal);
   }
   const best = bw.finish();
   const out = new Uint8Array(2 + best.length + 4);
   out[0] = 0x78; out[1] = 0x9c;
   out.set(best, 2);
   new DataView(out.buffer).setUint32(2 + best.length, adler32(data));
-  return { bytes: out, litFreqArr: blocks.map((b) => b.litFreq), distFreqArr: blocks.map((b) => b.distFreq) };
+  return { bytes: out, litFreqArr, distFreqArr };
 }
 
 // Deterministic xorshift32 PRNG (fixed seed; no clock, no Math.random).
@@ -1201,11 +1243,12 @@ export function deflateGlobalDP(data, opts = {}) {
   const n = data.length;
   const maxChain = opts.maxChain ?? 512;
   const stepBudget = (opts.stepBudgetPerByte ?? 256) * n;
+  const btDepth = opts.btDepth ?? 64;
   const maxRounds = opts.maxRounds ?? 7;
   const padded = new Uint8Array(n + 258);
   padded.set(data);
   const ws = makeDPWorkspace(n);
-  buildMatchCache(padded, n, maxChain, stepBudget, ws);
+  buildMatchCache(padded, n, maxChain, stepBudget, btDepth, ws);
   // MDL dynamic block boundaries (Carbon P2, measured +4,648 over fixed 256K).
   const { blockOf, numBlocks } = mdlBlockSplit(padded, n, ws.stepOff, ws.stepPack);
   const rng = makeXorshift(0x9e3779b9);
@@ -1215,7 +1258,6 @@ export function deflateGlobalDP(data, opts = {}) {
   let distFreqArr = null;
   let best = null;
   let bestBytes = Infinity;
-  let bestTokens = null;
   let stall = 0;
   for (let round = 0; round < maxRounds; round++) {
     let llArr = litLensArr;
@@ -1246,7 +1288,6 @@ export function deflateGlobalDP(data, opts = {}) {
     if (bytes.length < bestBytes) {
       bestBytes = bytes.length;
       best = bytes;
-      bestTokens = tokens;
       stall = 0;
     } else {
       stall++;
@@ -1261,12 +1302,6 @@ export function deflateGlobalDP(data, opts = {}) {
     });
     if (round >= 5 && stall >= 3) break;
   }
-  // Adjacent-block merge on the best round's tokens: re-emit with adjacent
-  // blocks merged when the merged exact bit count is strictly smaller.
-  // Keep the unmerged result as fallback (merged is <= unmerged by
-  // construction, but compare byte lengths to be safe).
-  const merged = emitGlobal(data, bestTokens, blockOf, numBlocks, true);
-  if (merged.bytes.length < bestBytes) return merged.bytes;
   return best;
 }
 
