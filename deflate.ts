@@ -1232,6 +1232,97 @@ function mdlBlockSplit(data, n, stepOff, stepPack) {
   return { blockOf, numBlocks: ranges.length };
 }
 
+// ---- V12: distance reselection (Astra's last untested lever) ----
+// The BT4 match cache only keeps "length innovation" steps, so for a winner
+// match (pos, len, dist) there may be OTHER distances achieving the same
+// length that were never recorded (found after a longer match was already
+// cached) — and the final Huffman tree is built from the winner tokens' own
+// frequencies, which can differ from the DP round's price table. So a
+// different distance with the same length can be cheaper under the final
+// tree. This post-processes ONLY the winning token list: fix each match's
+// start/length, re-select the cheapest distance (code length + extra bits)
+// among the cache steps at that position, verified by direct byte
+// comparison. Only distance codes already present in the block's tree are
+// tried (no new symbols). The caller re-emits and keeps whichever output
+// is shorter, so this cannot regress by bytes.
+export const reselectStats = { matches: 0, cheaperFound: 0, used: 0, distBitsSaved: 0 };
+
+function reselectDistances(data, tokens, blockOf, numBlocks, stepOff, stepPack) {
+  const stats = reselectStats;
+  // Per-block distance frequencies from the winner tokens (mirror emitGlobal).
+  const distFreq = Array.from({ length: numBlocks }, () => new Float64Array(30));
+  let pos = 0;
+  for (const t of tokens) {
+    if (typeof t !== 'number') distFreq[blockOf[pos]][distCodeOf(t.dist)]++;
+    pos += typeof t === 'number' ? 1 : t.len;
+  }
+  const distLens = distFreq.map((f) => {
+    if (f.every((x) => x === 0)) { const z = new Uint8Array(30); z[0] = 1; return z; }
+    return huffmanLengths(f, 15);
+  });
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const verify = (src, dst, len) => {
+    let k = 0;
+    while (k + 4 <= len) {
+      if (dv.getUint32(src + k, true) !== dv.getUint32(dst + k, true)) return false;
+      k += 4;
+    }
+    while (k < len) {
+      if (data[src + k] !== data[dst + k]) return false;
+      k++;
+    }
+    return true;
+  };
+  const out = [];
+  pos = 0;
+  for (const t of tokens) {
+    if (typeof t === 'number') { out.push(t); pos += 1; continue; }
+    const L = t.len;
+    const D = t.dist;
+    const b = blockOf[pos];
+    stats.matches++;
+    if (L < 3) { out.push(t); pos += L; continue; }
+    const curCode = distCodeOf(D);
+    const curCost = distLens[b][curCode] + DIST_EXTRA[curCode];
+    // Candidates: cache steps at this position with endLen >= L, cheapest first.
+    const cands = [];
+    const sBeg = stepOff[pos];
+    const sEnd = stepOff[pos + 1];
+    for (let s = sBeg; s < sEnd; s++) {
+      const packed = stepPack[s];
+      const d2 = packed >>> 16;
+      const endL = (packed & 0xff) + 3;
+      if (d2 === D || endL < L) continue;
+      const code2 = distCodeOf(d2);
+      if (distFreq[b][code2] === 0) continue; // code not in this block's tree
+      const cost2 = distLens[b][code2] + DIST_EXTRA[code2];
+      if (cost2 < curCost) cands.push([cost2, d2]);
+    }
+    let bestDist = D;
+    let bestCost = curCost;
+    if (cands.length > 0) {
+      cands.sort((a, b2) => a[0] - b2[0]);
+      // Try at most 3 alternative distances (cheapest first), each verified
+      // by direct byte comparison over the full length.
+      for (let v = 0; v < cands.length && v < 3; v++) {
+        const [cost2, d2] = cands[v];
+        if (verify(pos - d2, pos, L)) { bestDist = d2; bestCost = cost2; break; }
+      }
+      if (bestDist !== D) {
+        stats.cheaperFound++;
+        stats.used++;
+        stats.distBitsSaved += curCost - bestCost;
+      }
+    }
+    out.push(bestDist === D ? t : { len: L, dist: bestDist });
+    pos += L;
+  }
+  if (process.env.PNG_SQUEEZE_DIAG) {
+    console.error(`[reselect] cumulative matches=${stats.matches} cheaperFound=${stats.cheaperFound} used=${stats.used} distBitsSaved~${stats.distBitsSaved}`);
+  }
+  return { tokens: out, used: stats.used };
+}
+
 // Top-level v3 encoder: match cache once + fixed blocks + iterative global DP
 // with deterministic perturbation. Returns a zlib stream (Uint8Array).
 // opts: blockSize (default 262144), maxChain (default 256), stepBudgetPerByte
@@ -1350,8 +1441,19 @@ export function deflateGlobalDP(data, opts = {}) {
   // Keep the unmerged result as fallback (merged is <= unmerged by
   // construction, but compare byte lengths to be safe).
   const merged = emitGlobal(data, bestTokens, blockOf, numBlocks, true);
-  if (merged.bytes.length < bestBytes) return merged.bytes;
-  return best;
+  let finalBytes = best;
+  let finalLen = bestBytes;
+  if (merged.bytes.length < finalLen) { finalBytes = merged.bytes; finalLen = merged.bytes.length; }
+  // V12: distance reselection on the best round's tokens (Astra's last
+  // untested lever). Fix each match's start/length; only re-select a
+  // cheaper distance code under the final per-block tree, verified by
+  // direct byte comparison. Re-emit (with merge) and keep the shorter.
+  const resel = reselectDistances(padded, bestTokens, blockOf, numBlocks, stepOff, stepPack);
+  if (resel.used > 0) {
+    const rEmit = emitGlobal(data, resel.tokens, blockOf, numBlocks, true);
+    if (rEmit.bytes.length < finalLen) { finalBytes = rEmit.bytes; finalLen = rEmit.bytes.length; }
+  }
+  return finalBytes;
 }
 
 // Same as deflateOptimalBlocks but the per-block parse is the DP optimal parse
