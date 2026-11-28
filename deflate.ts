@@ -731,10 +731,20 @@ export function hasWasm() { return WASM !== null; }
 export function viterbiFilter(samples, width, height, bpp, litCost, lenCost, distCost, opts = {}) {
   if (!WASM) throw new Error('viterbi requires WASM');
   const ex = WASM;
-  if (typeof ex.viterbi_scan !== 'function') throw new Error('viterbi_scan not exported by WASM');
   const memU8 = new Uint8Array(ex.memory.buffer);
   const memU32 = new Uint32Array(ex.memory.buffer);
   memU8.set(samples, ex.ptr_data());
+  if (opts.online) {
+    // V13 online-entropy block-step Viterbi (hot.c viterbi_scan2): the price
+    // tables are derived inside WASM from each state's own frequencies, so
+    // the caller's litCost/lenCost/distCost are ignored.
+    if (typeof ex.viterbi_scan2 !== 'function') throw new Error('viterbi_scan2 not exported by WASM');
+    const total = ex.viterbi_scan2(width, height, bpp, opts.switchPenalty ?? 120 * 64);
+    if (total < 0) throw new Error('viterbi_scan2 failed: ' + total);
+    const seq = new Uint8Array(ex.memory.buffer, ex.ptr_vitSeq(), height).slice();
+    return { seq, totalCost: total * 64 };
+  }
+  if (typeof ex.viterbi_scan !== 'function') throw new Error('viterbi_scan not exported by WASM');
   memU32.set(litCost, ex.ptr_litCost() / 4);
   memU32.set(lenCost, ex.ptr_lenCost() / 4);
   memU32.set(distCost, ex.ptr_distCost() / 4);
