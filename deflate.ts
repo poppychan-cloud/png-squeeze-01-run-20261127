@@ -988,10 +988,24 @@ function fixedBlockBits(tokens) {
   return bits;
 }
 
+// Bit count of the encoding emitGlobal would pick for one block (dynamic if
+// ceil(dyn/8) <= ceil(fix/8), else fixed). Mirrors emitGlobal's choice exactly.
+function chosenBlockBits(tokens, litFreq, distFreq) {
+  const dyn = buildDynamic(litFreq, distFreq);
+  const dynBits = dynamicBlockBits(tokens, dyn);
+  const fixBits = fixedBlockBits(tokens);
+  return ((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3) ? dynBits : fixBits;
+}
+
 // Emit the DP token list as a zlib stream, one DEFLATE block per block index
 // (tokens grouped by the block of their start position; dynamic vs fixed per
 // block, smaller wins). Returns {bytes, litFreqArr, distFreqArr}.
-function emitGlobal(data, tokens, blockOf, numBlocks) {
+// When doMerge is true, adjacent blocks are merged first (one left-to-right
+// pass): a pair merges only when the merged block's exact bit count (one EOB,
+// Huffman table re-derived from the combined freqs) is strictly less than the
+// sum of the two separate blocks' bit counts. Merged bit counts can only stay
+// the same or decrease the total byte length, never increase it.
+function emitGlobal(data, tokens, blockOf, numBlocks, doMerge = false) {
   const blockTokens = Array.from({ length: numBlocks }, () => []);
   const litFreqArr = Array.from({ length: numBlocks }, () => new Float64Array(288));
   const distFreqArr = Array.from({ length: numBlocks }, () => new Float64Array(30));
@@ -1009,23 +1023,43 @@ function emitGlobal(data, tokens, blockOf, numBlocks) {
     }
   }
   for (let b = 0; b < numBlocks; b++) litFreqArr[b][256]++;
+  let blocks = [];
+  for (let b = 0; b < numBlocks; b++) blocks.push({ tokens: blockTokens[b], litFreq: litFreqArr[b], distFreq: distFreqArr[b] });
+  if (doMerge) {
+    const kept = [];
+    for (const blk of blocks) {
+      if (kept.length === 0) { kept.push(blk); continue; }
+      const last = kept[kept.length - 1];
+      const cTokens = last.tokens.concat(blk.tokens);
+      const cLit = new Float64Array(288);
+      for (let i = 0; i < 288; i++) cLit[i] = last.litFreq[i] + blk.litFreq[i];
+      cLit[256] = 1; // merged block carries a single EOB, not two
+      const cDist = new Float64Array(30);
+      for (let i = 0; i < 30; i++) cDist[i] = last.distFreq[i] + blk.distFreq[i];
+      const sepBits = chosenBlockBits(last.tokens, last.litFreq, last.distFreq) + chosenBlockBits(blk.tokens, blk.litFreq, blk.distFreq);
+      const mrgBits = chosenBlockBits(cTokens, cLit, cDist);
+      if (mrgBits < sepBits) kept[kept.length - 1] = { tokens: cTokens, litFreq: cLit, distFreq: cDist };
+      else kept.push(blk);
+    }
+    blocks = kept;
+  }
   const bw = new BitWriter();
-  for (let b = 0; b < numBlocks; b++) {
-    const isFinal = b === numBlocks - 1;
-    const dyn = buildDynamic(litFreqArr[b], distFreqArr[b]);
+  for (let b = 0; b < blocks.length; b++) {
+    const isFinal = b === blocks.length - 1;
+    const dyn = buildDynamic(blocks[b].litFreq, blocks[b].distFreq);
     // Pick dynamic vs fixed by exact bit counts (same ceil/8 rounding and
     // dynamic-wins-ties rule as the old trial-write), then emit only the winner.
-    const dynBits = dynamicBlockBits(blockTokens[b], dyn);
-    const fixBits = fixedBlockBits(blockTokens[b]);
-    if (((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3)) emitDynamicBlock(bw, blockTokens[b], dyn, isFinal);
-    else emitFixedBlock(bw, blockTokens[b], isFinal);
+    const dynBits = dynamicBlockBits(blocks[b].tokens, dyn);
+    const fixBits = fixedBlockBits(blocks[b].tokens);
+    if (((dynBits + 7) >> 3) <= ((fixBits + 7) >> 3)) emitDynamicBlock(bw, blocks[b].tokens, dyn, isFinal);
+    else emitFixedBlock(bw, blocks[b].tokens, isFinal);
   }
   const best = bw.finish();
   const out = new Uint8Array(2 + best.length + 4);
   out[0] = 0x78; out[1] = 0x9c;
   out.set(best, 2);
   new DataView(out.buffer).setUint32(2 + best.length, adler32(data));
-  return { bytes: out, litFreqArr, distFreqArr };
+  return { bytes: out, litFreqArr: blocks.map((b) => b.litFreq), distFreqArr: blocks.map((b) => b.distFreq) };
 }
 
 // Deterministic xorshift32 PRNG (fixed seed; no clock, no Math.random).
@@ -1181,6 +1215,7 @@ export function deflateGlobalDP(data, opts = {}) {
   let distFreqArr = null;
   let best = null;
   let bestBytes = Infinity;
+  let bestTokens = null;
   let stall = 0;
   for (let round = 0; round < maxRounds; round++) {
     let llArr = litLensArr;
@@ -1211,6 +1246,7 @@ export function deflateGlobalDP(data, opts = {}) {
     if (bytes.length < bestBytes) {
       bestBytes = bytes.length;
       best = bytes;
+      bestTokens = tokens;
       stall = 0;
     } else {
       stall++;
@@ -1225,6 +1261,12 @@ export function deflateGlobalDP(data, opts = {}) {
     });
     if (round >= 5 && stall >= 3) break;
   }
+  // Adjacent-block merge on the best round's tokens: re-emit with adjacent
+  // blocks merged when the merged exact bit count is strictly smaller.
+  // Keep the unmerged result as fallback (merged is <= unmerged by
+  // construction, but compare byte lengths to be safe).
+  const merged = emitGlobal(data, bestTokens, blockOf, numBlocks, true);
+  if (merged.bytes.length < bestBytes) return merged.bytes;
   return best;
 }
 
