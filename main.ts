@@ -572,6 +572,9 @@ for (const id of readdirSync(I).sort()) {
   let { form, data, choice, seq, bytes } = screen(image.rgba, image.width, image.height);
   // P4 band descent (Carbon, measured +4,246 over MDL-only): flip whole 16-row
   // bands, keeping only flips the full-stream zlib-6 verifies as better.
+  // (Viterbi-lite was tried and reverted: -3,933 pts, i002 -33,441 — the DP
+  // over per-row deflateSync costs optimises the wrong objective; the
+  // full-stream optimal parse disagrees. See v7-build-report.)
   const bd = bandDescent(form, data, seq, image.width, image.height);
   if (bd.flips > 0) {
     // screen() already compressed this exact stream at zlib-6: bytes is
