@@ -56,12 +56,12 @@ function distCodeOf(dist) {
 
 // ---- Huffman: code lengths from frequencies (priority queue), canonical codes ----
 // Fixed-Huffman literal lengths (RFC 1951) as the first-iteration cost model.
-const FIXED_LIT_LEN = new Uint8Array(288);
+export const FIXED_LIT_LEN = new Uint8Array(288);
 for (let i = 0; i < 144; i++) FIXED_LIT_LEN[i] = 8;
 for (let i = 144; i < 256; i++) FIXED_LIT_LEN[i] = 9;
 for (let i = 256; i < 280; i++) FIXED_LIT_LEN[i] = 7;
 for (let i = 280; i < 288; i++) FIXED_LIT_LEN[i] = 8;
-const FIXED_DIST_LEN = new Uint8Array(30).fill(5);
+export const FIXED_DIST_LEN = new Uint8Array(30).fill(5);
 
 // Clamp code lengths to `maxLen` and repair the Kraft sum to EXACTLY 1 (a
 // complete prefix code). The old version lengthened the rarest symbol until
@@ -127,7 +127,7 @@ function limitLengths(freqs, lengths, maxLen) {
   return out;
 }
 
-function huffmanLengths(freqs, maxLen) {
+export function huffmanLengths(freqs, maxLen) {
   // freqs: array of counts (0 = unused). Returns Uint8Array of code lengths,
   // every length <= maxLen, Kraft sum <= 1.
   const n = freqs.length;
@@ -717,6 +717,39 @@ export function deflateOptimalBlocks(data, blockSize, maxChain = 64, niceLen = 3
 let WASM = null;
 export function setWasm(w) { WASM = w; }
 export function hasWasm() { return WASM !== null; }
+
+// ---- Viterbi filter selection (V10) ----
+// Runs the WASM 5-state path-conditioned Viterbi over the row filters for
+// `samples` (unfiltered, row-major, stride = width*bpp). litCost/lenCost/
+// distCost are 1/64-bit price tables in buildCostTables layout (pass 1: a
+// single global block; pass 2: per-block tables + opts.stripBlockOf, a
+// per-row block index array). Returns {seq, totalCost}. Requires WASM.
+// The samples are copied into g_data (the Viterbi reads them there) and the
+// price tables into g_litCost/g_lenCost/g_distCost. This runs BEFORE
+// deflateGlobalDP, which overwrites g_data and the cost tables with its own
+// inputs, so there is no conflict.
+export function viterbiFilter(samples, width, height, bpp, litCost, lenCost, distCost, opts = {}) {
+  if (!WASM) throw new Error('viterbi requires WASM');
+  const ex = WASM;
+  if (typeof ex.viterbi_scan !== 'function') throw new Error('viterbi_scan not exported by WASM');
+  const memU8 = new Uint8Array(ex.memory.buffer);
+  const memU32 = new Uint32Array(ex.memory.buffer);
+  memU8.set(samples, ex.ptr_data());
+  memU32.set(litCost, ex.ptr_litCost() / 4);
+  memU32.set(lenCost, ex.ptr_lenCost() / 4);
+  memU32.set(distCost, ex.ptr_distCost() / 4);
+  const useStrip = opts.stripBlockOf ? 1 : 0;
+  if (useStrip) {
+    memU8.set(opts.stripBlockOf, ex.ptr_vitBlockOf());
+    memU32.set(opts.stripLitCost, ex.ptr_litCost() / 4);
+    memU32.set(opts.stripLenCost, ex.ptr_lenCost() / 4);
+    memU32.set(opts.stripDistCost, ex.ptr_distCost() / 4);
+  }
+  const total = ex.viterbi_scan(width, height, bpp, useStrip, opts.switchPenalty ?? 120 * 64, opts.pruneBits ?? 512 * 64);
+  if (total < 0) throw new Error('viterbi_scan failed: ' + total);
+  const seq = new Uint8Array(ex.memory.buffer, ex.ptr_vitSeq(), height).slice();
+  return { seq, totalCost: total };
+}
 // Fixed-point DP costs in units of 1/64 bit (Uint32; the max cost for a
 // 3.7MB stream is far below 2^31, so additions never overflow).
 const DP_INF = 0xffffffff;
@@ -909,7 +942,7 @@ function backtrackTokens(data, n, pathLen, pathDist) {
 // Per-block Huffman cost tables (fixed point) from per-block Huffman lengths.
 // litCost[b*256+byte], lenCost[b*259+len] (len 0..258, raw length),
 // distCost[b*32769+dist].
-function buildCostTables(numBlocks, litLensArr, distLensArr) {
+export function buildCostTables(numBlocks, litLensArr, distLensArr) {
   const litCost = new Uint32Array(numBlocks * 256);
   const lenCost = new Uint32Array(numBlocks * 259);
   const distCost = new Uint32Array(numBlocks * 32769);
